@@ -21,8 +21,6 @@ LOGGER = logging.getLogger(__name__)
 # Map actions to required permission scopes
 ACTION_PERMISSION_MAP: Dict[str, PermissionScope] = {
     "execute_bash": PermissionScope.TOOL_BASH_RUN,
-    "take_screenshot": PermissionScope.CONTEXT_VISION_READ_SCREEN,
-    "analyze_screenshot": PermissionScope.CONTEXT_VISION_READ_SCREEN,
     "read_clipboard": PermissionScope.TOOL_CLIPBOARD_READ,
     # File operations would map to TOOL_FILE_READ_ALL or TOOL_FILE_WRITE_SANDBOX
     # AT-SPI operations would map to CONTEXT_ATSPI_READ_APPS or CONTEXT_ATSPI_CONTROL_APPS
@@ -41,8 +39,6 @@ class DecisionExecutor:
             "fetch_fact": self._handle_fetch_fact,
             "read_clipboard": self._handle_read_clipboard,
             "execute_bash": self._handle_execute_bash,
-            "take_screenshot": self._handle_take_screenshot,
-            "analyze_screenshot": self._handle_analyze_screenshot,
             "check_system_status": self._handle_check_system_status,
             "save_episodic_memory": self._handle_save_episodic_memory,
             "get_system_metrics": self._handle_get_system_metrics,

@@ -118,14 +118,24 @@ class ProductivityTools:
         """Capture a screenshot and return the file path."""
         screenshot_path = Path("/tmp/shimeji_screenshot.png")
         
-        # Try gnome-screenshot first
+        try:
+            import pydbus
+            bus = pydbus.SessionBus()
+            shell = bus.get("org.gnome.Shell.Screenshot", "/org/gnome/Shell/Screenshot")
+            success, filename = shell.Screenshot(False, False, str(screenshot_path))
+            if success and screenshot_path.exists():
+                LOGGER.debug("Screenshot captured via GNOME Shell DBus: %s", screenshot_path)
+                return screenshot_path
+        except Exception as exc:
+            LOGGER.debug("GNOME Shell DBus screenshot failed: %s", exc)
+        
         try:
             result = subprocess.run(
                 ["gnome-screenshot", "-f", str(screenshot_path)],
                 capture_output=True,
                 timeout=5,
+                env={**os.environ, "GTK_THEME": "Adwaita:dark"}
             )
-            # gnome-screenshot may output warnings to stderr but still succeed
             if screenshot_path.exists():
                 LOGGER.debug("Screenshot captured via gnome-screenshot: %s", screenshot_path)
                 return screenshot_path
@@ -138,7 +148,6 @@ class ProductivityTools:
         except Exception as exc:
             LOGGER.debug("gnome-screenshot error: %s", exc)
         
-        # Try scrot as fallback
         try:
             result = subprocess.run(
                 ["scrot", str(screenshot_path)],

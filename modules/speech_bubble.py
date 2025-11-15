@@ -305,38 +305,29 @@ class SpeechBubbleOverlay:
                 layout.addLayout(search_layout)
                 layout.addLayout(controls)
 
-                # Ensure hidden before docking
                 self.hide()
                 self.setVisible(False)
                 self.dock()
-                
-                # Use longer delay to ensure Qt has fully processed everything
-                # Process events multiple times to ensure stylesheet is applied
                 QApplication.processEvents()
                 QTimer.singleShot(200, lambda: self._delayed_show())
                 LOGGER.info("Chat panel initialized (will show after style application)")
             
             def _delayed_show(self) -> None:
                 """Show window after styles are applied to prevent white flash."""
-                # Double-check we're still hidden
                 if self.isVisible():
                     LOGGER.warning("ChatWindow was already visible before delayed show!")
                     return
                 
-                # Ensure stylesheet is applied
                 self.setStyleSheet("QWidget { background-color: #1a1a1a; }")
-                # Process events multiple times to ensure stylesheet is applied
                 QApplication.processEvents()
                 QApplication.processEvents()
-                # Set opacity to full before showing
                 self.setWindowOpacity(1.0)
-                # Process events again after setting opacity
                 QApplication.processEvents()
-                # Now show
                 self.show()
                 self.raise_()
                 self.activateWindow()
                 LOGGER.info("Chat panel shown at %s", self.pos())
+
 
             def dock(self) -> None:
                 """Position chat window in bottom-right corner of screen."""
@@ -351,14 +342,16 @@ class SpeechBubbleOverlay:
 
             def show_panel(self) -> None:
                 """Show the chat panel, ensuring styles are applied first."""
-                # Ensure stylesheet is applied before showing
                 self.setStyleSheet("QWidget { background-color: #1a1a1a; }")
                 QApplication.processEvents()
+                QApplication.processEvents()
                 self.setWindowOpacity(1.0)
+                QApplication.processEvents()
                 self.dock()
                 self.show()
                 self.raise_()
                 self.activateWindow()
+                LOGGER.info("Chat panel shown at %s", self.pos())
 
             def append_message(self, author: str, text: str, persist: bool = True) -> None:
                 author = author or "Shimeji"
@@ -783,12 +776,15 @@ class SpeechBubbleOverlay:
             """A chat bubble that follows the Shimeji and shows the most recent message."""
             def __init__(self) -> None:
                 super().__init__()
+                self.hide()
+                self.move(-10000, -10000)
+                self.setWindowOpacity(0.0)
                 self.setWindowTitle("Shimeji Speech")
                 self.setWindowFlag(Qt.Window, True)
                 self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
                 self.setWindowFlag(Qt.FramelessWindowHint, True)
                 self.setAttribute(Qt.WA_TranslucentBackground, True)
-                # Ensure widget background is transparent
+                self.setAttribute(Qt.WA_ShowWithoutActivating, True)
                 self.setStyleSheet("QWidget { background-color: transparent; }")
                 
                 self._current_text = QTextEdit(self)
@@ -811,11 +807,6 @@ class SpeechBubbleOverlay:
                 self.setMinimumHeight(80)
                 self.setMaximumHeight(400)
 
-                # Hide immediately before any timers start to prevent flash
-                self.hide()
-                self.setVisible(False)
-                
-                # Track if we have content to show
                 self._has_content = False
 
                 self._reposition_timer = QTimer(self)
@@ -910,20 +901,19 @@ class SpeechBubbleOverlay:
                 new_height = min(400, max(80, int(doc_size.height()) + 50))
                 self.setFixedSize(new_width, new_height)
                 
-                # Position first, then show
                 self._update_position()
                 
-                # Show and reset opacity
                 self._current_opacity = 1.0
-                self.setWindowOpacity(self._current_opacity)
+                QApplication.processEvents()
+                QApplication.processEvents()
+                self.setWindowOpacity(1.0)
+                QApplication.processEvents()
                 self.show()
                 self.raise_()
                 
-                # Start reposition timer now that we have content
                 if not self._reposition_timer.isActive():
                     self._reposition_timer.start(100)
                 
-                # Cancel any existing fade timer
                 if self._fade_timer:
                     self._fade_timer.stop()
                     self._fade_timer = None

@@ -191,27 +191,7 @@ def build_proactive_function_declarations(
                 "required": ["command"],
             },
         },
-        {
-            "name": "take_screenshot",
-            "description": "Capture a screenshot of the user's screen to see what they're working on.",
-            "parameters": {
-                "type": "OBJECT",
-                "properties": {},
-            },
-        },
-        {
-            "name": "analyze_screenshot",
-            "description": "Capture a screenshot and analyze it with vision AI to see what the user is working on, debug code, or understand their screen context.",
-            "parameters": {
-                "type": "OBJECT",
-                "properties": {
-                    "question": {
-                        "type": "STRING",
-                        "description": "Optional question about what to look for in the screenshot (e.g., 'What code is on screen?', 'What error do you see?').",
-                    }
-                },
-            },
-        },
+
         {
             "name": "check_system_status",
             "description": "Check battery, CPU, and memory status to monitor system health.",

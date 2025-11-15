@@ -1,5 +1,14 @@
 # Changelog
 
+## 2025-01-15 - Features & Bug Fixes
+
+### Shimeji Window-Sitting Feature
+- **Shimeji now sits on top of application windows**: Added window-sitting feature where the Shimeji mascot positions itself on top of the active application window (like Chrome, Firefox, etc.)
+- **Active window detection**: Uses ActiveWindowObserver to detect the currently active window
+- **Automatic positioning**: When an active window is detected, Shimeji centers horizontally and sits at the top (title bar area) of the window
+- **Follows window movement**: Shimeji automatically repositions as the active window changes or moves
+- **Fallback to normal behavior**: If no active window is detected, Shimeji uses normal anchor-based positioning
+
 ## 2025-01-15 - Bug Fixes
 
 ### Fixed White Box Rendering Issue

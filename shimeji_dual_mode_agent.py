@@ -1249,12 +1249,20 @@ class DualModeAgent:
         """Fallback using PIL Image."""
         try:
             import PIL.Image
-            img = PIL.Image.open(image_path)
+            
+            # Define function outside lambda for multiprocessing compatibility
+            def _generate_content(img_path: str, q: str, m) -> Any:
+                img = PIL.Image.open(img_path)
+                return m.generate_content([img, q])
+            
             # Use process pool for blocking operations
             executor = self._process_pool if self._process_pool else None
             response = await loop.run_in_executor(
                 executor,
-                lambda: model.generate_content([img, question])
+                _generate_content,
+                image_path,
+                question,
+                model
             )
             return self._extract_text_from_response(response)
         except ImportError:
@@ -1269,15 +1277,26 @@ class DualModeAgent:
         """Last resort: upload file to Gemini."""
         uploaded_file = None
         try:
+            # Define functions outside lambda for multiprocessing compatibility
+            def _upload_file(path: str) -> Any:
+                return genai.upload_file(path=path)
+            
+            def _generate_with_upload(uf, q: str, m) -> Any:
+                return m.generate_content([uf, q])
+            
             # Use process pool for blocking file operations
             executor = self._process_pool if self._process_pool else None
             uploaded_file = await loop.run_in_executor(
                 executor,
-                lambda: genai.upload_file(path=image_path)
+                _upload_file,
+                image_path
             )
             response = await loop.run_in_executor(
                 executor,
-                lambda: model.generate_content([uploaded_file, question])
+                _generate_with_upload,
+                uploaded_file,
+                question,
+                model
             )
             return self._extract_text_from_response(response)
         except Exception as exc:
@@ -1286,11 +1305,15 @@ class DualModeAgent:
         finally:
             if uploaded_file:
                 try:
+                    def _delete_file(name: str) -> None:
+                        genai.delete_file(name)
+                    
                     executor = self._process_pool if self._process_pool else None
                     loop = asyncio.get_running_loop()
                     await loop.run_in_executor(
                         executor,
-                        lambda: genai.delete_file(uploaded_file.name)
+                        _delete_file,
+                        uploaded_file.name
                     )
                 except Exception as cleanup_exc:
                     LOGGER.warning("Failed to cleanup uploaded file: %s", cleanup_exc)

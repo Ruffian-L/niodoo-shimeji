@@ -47,7 +47,8 @@ class SynthesisAgent:
         self._running = False
         if self._task:
             self._task.cancel()
-            with asyncio.suppress(asyncio.CancelledError):
+            from contextlib import suppress
+            with suppress(asyncio.CancelledError):
                 await self._task
             self._task = None
     

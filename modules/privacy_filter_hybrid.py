@@ -48,7 +48,7 @@ class HybridPrivacyFilter:
                     check=False
                 )
                 return result.returncode == 0
-            except (FileNotFoundError, subprocess.TimeoutError):
+            except (FileNotFoundError, TimeoutError):
                 LOGGER.debug("Ollama not available")
                 return False
         elif self._provider == "gpt4all":

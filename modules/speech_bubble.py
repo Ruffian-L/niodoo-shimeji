@@ -166,6 +166,9 @@ class SpeechBubbleOverlay:
                 # Make it movable - keep title bar
                 # self.setWindowFlag(Qt.FramelessWindowHint, True)
                 
+                # Set explicit dark background to prevent white box flash
+                self.setStyleSheet("QWidget { background-color: #1a1a1a; }")
+                
                 # Size based on screen - 35% of screen width, wider and shorter
                 screen = QApplication.primaryScreen()
                 if screen:
@@ -818,6 +821,12 @@ class SpeechBubbleOverlay:
                     self.hide()
                     return
                 
+                # Don't show if there's no anchor (Shimeji position)
+                anchor = current_anchor()
+                if not anchor:
+                    LOGGER.debug("BubbleBox: No anchor available, not showing message")
+                    return
+                
                 escaped_text = html.escape(text)
                 display = f"<b style='color:#333'>{html.escape(author)}:</b><br>{escaped_text}"
                 self._current_text.setHtml(display)
@@ -868,8 +877,10 @@ class SpeechBubbleOverlay:
                     x = int(anchor[0] + 20)
                     y = int(anchor[1] - self.height() - 60)
                 else:
-                    x = geometry.right() - self.width() - 50
-                    y = geometry.bottom() - self.height() - 150
+                    # If no anchor, hide the bubble instead of showing in middle of screen
+                    if self.isVisible():
+                        self.hide()
+                    return
                 x = max(geometry.left() + 20, min(x, geometry.right() - self.width() - 20))
                 y = max(geometry.top() + 20, min(y, geometry.bottom() - self.height() - 20))
                 self.move(x, y)

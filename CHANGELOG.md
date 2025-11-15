@@ -5,7 +5,9 @@
 ### Fixed White Box Rendering Issue
 - **Fixed random white box appearing**: Added explicit transparent background stylesheet to `BubbleBox` widget to ensure widget background is fully transparent
 - **Empty message guard**: Added check in `add_message()` to prevent showing empty bubbles, ensuring widget stays hidden when there's no content
-- **Root cause**: Widget container wasn't explicitly set to transparent background, causing solid white box to appear even with `WA_TranslucentBackground` attribute
+- **ChatWindow background fix**: Added explicit dark background (#1a1a1a) to `ChatWindow` widget to prevent white box flash during initialization
+- **BubbleBox positioning fix**: Added anchor check in `add_message()` and `_update_position()` to prevent bubble from appearing in middle of screen when Shimeji anchor is unavailable
+- **Root cause**: Widget containers weren't explicitly set to proper background colors, causing solid white boxes to appear during initialization or when anchor position is missing
 
 ## 2025-01-15 - Proactive Companion Architecture Implementation - COMPLETE
 

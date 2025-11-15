@@ -13,9 +13,7 @@ import google.generativeai as genai
 from google.generativeai import types as genai_types
 
 from modules.brains.shared import ProactiveDecision, RateLimiter
-
-# Default interval constant (matches shimeji_dual_mode_agent.py)
-DEFAULT_PROACTIVE_INTERVAL = 45
+from modules.constants import DEFAULT_PROACTIVE_INTERVAL_SECONDS
 
 LOGGER = logging.getLogger(__name__)
 
@@ -101,7 +99,7 @@ class ProactiveBrain:
 
         start_time = time.monotonic()
         cached = self._cache_name is not None
-        
+
         def _call():
             if self._cache_name:
                 return self._model.generate_content(
@@ -110,8 +108,21 @@ class ProactiveBrain:
                 )
             return self._model.generate_content(payload)
 
-        response = await loop.run_in_executor(None, _call)
-        duration = time.monotonic() - start_time
+        try:
+            response = await loop.run_in_executor(None, _call)
+            duration = time.monotonic() - start_time
+
+            # Record success for circuit breaker
+            if self._rate_limiter:
+                self._rate_limiter.record_success()
+        except Exception as exc:
+            duration = time.monotonic() - start_time
+
+            # Record failure for circuit breaker
+            if self._rate_limiter:
+                self._rate_limiter.record_failure(exc)
+
+            raise
         
         # Record metrics if agent available
         if hasattr(self, '_agent') and self._agent and hasattr(self._agent, '_metrics'):
@@ -135,7 +146,10 @@ class ProactiveBrain:
 
         if not function_call:
             LOGGER.warning("Gemini returned no function call; defaulting to observe_and_wait")
-            return ProactiveDecision("observe_and_wait", {"duration_seconds": DEFAULT_PROACTIVE_INTERVAL})
+            return ProactiveDecision(
+                "observe_and_wait",
+                {"duration_seconds": DEFAULT_PROACTIVE_INTERVAL_SECONDS},
+            )
 
         decision = ProactiveDecision(function_call.name, dict(function_call.args))
         

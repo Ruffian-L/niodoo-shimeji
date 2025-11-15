@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -21,7 +22,6 @@ LOGGER = logging.getLogger(__name__)
 # Map actions to required permission scopes
 ACTION_PERMISSION_MAP: Dict[str, PermissionScope] = {
     "execute_bash": PermissionScope.TOOL_BASH_RUN,
-    "read_clipboard": PermissionScope.TOOL_CLIPBOARD_READ,
     # File operations would map to TOOL_FILE_READ_ALL or TOOL_FILE_WRITE_SANDBOX
     # AT-SPI operations would map to CONTEXT_ATSPI_READ_APPS or CONTEXT_ATSPI_CONTROL_APPS
 }
@@ -37,7 +37,6 @@ class DecisionExecutor:
             "observe_and_wait": self._handle_observe_and_wait,
             "show_dialogue": self._handle_show_dialogue,
             "fetch_fact": self._handle_fetch_fact,
-            "read_clipboard": self._handle_read_clipboard,
             "execute_bash": self._handle_execute_bash,
             "check_system_status": self._handle_check_system_status,
             "save_episodic_memory": self._handle_save_episodic_memory,
@@ -79,7 +78,7 @@ class DecisionExecutor:
             required_scope = ACTION_PERMISSION_MAP.get(action)
             if required_scope:
                 agent_id = getattr(decision, 'agent_id', 'ProactiveBrain')
-                permission_status = self.agent._permission_manager.check_permission(
+                permission_status = await self.agent._permission_manager.check_permission_async(
                     agent_id, required_scope
                 )
                 
@@ -101,7 +100,7 @@ class DecisionExecutor:
                         LOGGER.info("User denied permission for %s.%s", agent_id, required_scope.value)
                         return self.agent._reaction_interval
                     # User granted - set to allow for future
-                    self.agent._permission_manager.set_permission(
+                    await self.agent._permission_manager.set_permission_async(
                         agent_id, required_scope, PermissionStatus.ALLOW
                     )
         
@@ -303,15 +302,6 @@ class DecisionExecutor:
         self.agent.overlay.show_bubble_message("Shimeji", fact, duration=8)
         return self.agent._reaction_interval
     
-    async def _handle_read_clipboard(self, args: Dict[str, Any], context: Dict[str, Any]) -> int:
-        """Handle read_clipboard action."""
-        clipboard_content = ProductivityTools.read_clipboard()
-        if clipboard_content:
-            self.agent.overlay.show_chat_message("Shimeji", f"You copied: {clipboard_content[:500]}")
-        else:
-            self.agent.overlay.show_bubble_message("Shimeji", "Clipboard is empty!", duration=3)
-        return self.agent._reaction_interval
-    
     async def _handle_execute_bash(self, args: Dict[str, Any], context: Dict[str, Any]) -> int:
         """Handle execute_bash action."""
         command = args.get("command", "")
@@ -359,7 +349,7 @@ class DecisionExecutor:
         if fact:
             enriched_metadata = metadata or {}
             enriched_metadata.setdefault("context", context)
-            self.agent.memory.save_fact(fact, enriched_metadata)
+            await self.agent.memory.save_fact_async(fact, enriched_metadata)
         self.agent._dispatch_dialogue()
         return self.agent._reaction_interval
     
@@ -456,7 +446,7 @@ class DecisionExecutor:
                 except ValueError:
                     pass  # Keep as string
             
-            self.agent.memory.set_pref(key, value)
+            await self.agent.memory.set_pref_async(key, value)
             self.agent.overlay.show_chat_message("Shimeji", f"Updated preference: {key} = {value}")
             LOGGER.info("Monitoring preference updated: %s = %s", key, value)
             
@@ -469,7 +459,7 @@ class DecisionExecutor:
     async def _handle_get_monitoring_preferences(self, args: Dict[str, Any], context: Dict[str, Any]) -> int:
         """Handle get_monitoring_preferences action."""
         try:
-            prefs = self.agent.memory.get_all_prefs()
+            prefs = await self.agent.memory.get_all_prefs_async()
             
             # Filter to only monitoring-related preferences
             monitoring_prefs = {
@@ -647,7 +637,7 @@ class DecisionExecutor:
             
             # Parse time (simplified - would need better parsing)
             # Store in memory for now
-            self.agent.memory.save_fact(
+            await self.agent.memory.save_fact_async(
                 f"Scheduled task: {task_description} at {time_str}",
                 metadata={"task": task_description, "time": time_str, "recurrence": recurrence}
             )
@@ -670,7 +660,7 @@ class DecisionExecutor:
             return self.agent._reaction_interval
         
         # Store reminder in memory
-        self.agent.memory.save_fact(
+        await self.agent.memory.save_fact_async(
             f"Reminder: {message} at {time_str}",
             metadata={"reminder": message, "time": time_str}
         )
@@ -817,7 +807,8 @@ class DecisionExecutor:
                 return self.agent._reaction_interval
             
             feedback_learner = FeedbackLearner(self.agent.memory)
-            feedback_learner.record_feedback(action, user_response, context_data)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, feedback_learner.record_feedback, action, user_response, context_data)
             
             self.agent.overlay.show_chat_message("Shimeji", f"Feedback recorded: {action} -> {user_response}")
             
@@ -899,7 +890,7 @@ class DecisionExecutor:
                     self.agent.overlay.show_chat_message("Shimeji", "No results found")
             else:
                 # Fallback to regular search
-                results = self.agent.memory.recall_relevant({"query": query}, limit)
+                results = await self.agent.memory.recall_relevant_async({"query": query}, limit)
                 if results:
                     response = f"Search results for '{query}':\n\n"
                     for i, result in enumerate(results[:limit], 1):
@@ -995,7 +986,7 @@ class DecisionExecutor:
             data = {}
         
         # Store knowledge for sharing (would be sent via HTTP in real implementation)
-        self.agent.memory.save_fact(
+        await self.agent.memory.save_fact_async(
             f"Shared knowledge: {knowledge_type}",
             metadata={"type": knowledge_type, "data": data}
         )
@@ -1018,7 +1009,7 @@ class DecisionExecutor:
         self.agent.overlay.show_chat_message("Shimeji", message)
         
         # Store permission request
-        self.agent.memory.save_fact(
+        await self.agent.memory.save_fact_async(
             f"Permission requested: {tool_name}",
             metadata={"tool": tool_name, "reason": reason, "status": "pending"}
         )

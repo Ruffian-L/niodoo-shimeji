@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
 import re
 import sqlite3
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
-from typing import Any, Deque, Dict, Iterable, List, Optional
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, TypeVar
+
+T = TypeVar("T")
 
 
 def _timestamp() -> str:
@@ -49,13 +55,15 @@ class EpisodicMemory:
         self._conn: Optional[sqlite3.Connection] = sqlite3.connect(self.db_path, check_same_thread=False)
         if self._conn:
             self._conn.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
         self._initialise()
 
     def _initialise(self) -> None:
         if not self._conn:
             return
-        with self._conn:
-            self._conn.execute(
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS episodes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,50 +72,50 @@ class EpisodicMemory:
                     metadata TEXT
                 )
                 """
-            )
-            # Create user preferences table
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS user_prefs (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
                 )
-                """
-            )
-            # Create user model table (P3.1)
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS user_model (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                # Create user preferences table
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_prefs (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            # Create event log table (P3.2)
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS event_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    data TEXT
+                # Create user model table (P3.1)
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_model (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            # Create potential workflow table (P3.2)
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS potential_workflow (
-                    pattern_sequence TEXT PRIMARY KEY,
-                    count INTEGER NOT NULL,
-                    last_seen TEXT NOT NULL
+                # Create event log table (P3.2)
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS event_log (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        data TEXT
+                    )
+                    """
                 )
-                """
-            )
-            # Initialize default preferences if table is empty
-            self._init_default_preferences()
+                # Create potential workflow table (P3.2)
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS potential_workflow (
+                        pattern_sequence TEXT PRIMARY KEY,
+                        count INTEGER NOT NULL,
+                        last_seen TEXT NOT NULL
+                    )
+                    """
+                )
+                # Initialize default preferences if table is empty
+                self._init_default_preferences()
 
     def add(self, fact: str, metadata: Optional[Dict[str, object]] = None) -> None:
         if not self._conn:
@@ -116,20 +124,22 @@ class EpisodicMemory:
         if not fact:
             return
         meta = json.dumps(metadata, ensure_ascii=False) if metadata else None
-        with self._conn:
-            self._conn.execute(
-                "INSERT INTO episodes(timestamp, fact, metadata) VALUES (?, ?, ?)",
-                (_timestamp(), fact, meta),
-            )
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT INTO episodes(timestamp, fact, metadata) VALUES (?, ?, ?)",
+                    (_timestamp(), fact, meta),
+                )
 
     def recent(self, limit: int = 5) -> List[Dict[str, str]]:
         if not self._conn:
             return []
-        cursor = self._conn.execute(
-            "SELECT timestamp, fact, metadata FROM episodes ORDER BY id DESC LIMIT ?",
-            (limit,),
-        )
-        return [dict(row) for row in cursor.fetchall()]
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT timestamp, fact, metadata FROM episodes ORDER BY id DESC LIMIT ?",
+                (limit,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
     def search(self, query: str, limit: int = 5) -> List[Dict[str, str]]:
         if not self._conn:
@@ -138,24 +148,25 @@ class EpisodicMemory:
             return self.recent(limit)
 
         tokens = [token.lower() for token in re.findall(r"\w+", query) if len(token) > 2]
-        cursor = self._conn.execute(
-            "SELECT id, timestamp, fact, metadata FROM episodes ORDER BY id DESC LIMIT 200"
-        )
-        scored: List[tuple[int, Dict[str, str]]] = []
-        for row in cursor.fetchall():
-            fact_text = row["fact"].lower()
-            score = sum(fact_text.count(token) for token in tokens) if tokens else 1
-            if score > 0:
-                scored.append(
-                    (
-                        score,
-                        {
-                            "timestamp": row["timestamp"],
-                            "fact": row["fact"],
-                            "metadata": row["metadata"],
-                        },
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT id, timestamp, fact, metadata FROM episodes ORDER BY id DESC LIMIT 200"
+            )
+            scored: List[tuple[int, Dict[str, str]]] = []
+            for row in cursor.fetchall():
+                fact_text = row["fact"].lower()
+                score = sum(fact_text.count(token) for token in tokens) if tokens else 1
+                if score > 0:
+                    scored.append(
+                        (
+                            score,
+                            {
+                                "timestamp": row["timestamp"],
+                                "fact": row["fact"],
+                                "metadata": row["metadata"],
+                            },
+                        )
                     )
-                )
         scored.sort(key=lambda item: item[0], reverse=True)
         return [item[1] for item in scored[:limit]]
 
@@ -164,16 +175,27 @@ class EpisodicMemory:
             self._conn.close()
             self._conn = None
 
+    def __enter__(self) -> "EpisodicMemory":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:  # pragma: no cover - defensive cleanup
+        with contextlib.suppress(Exception):
+            self.close()
+
     def cleanup_old_episodes(self, days_to_keep: int = 30) -> None:
         """Remove episodes older than N days."""
         if not self._conn:
             return
         cutoff = (datetime.now(UTC) - timedelta(days=days_to_keep)).isoformat()
-        with self._conn:
-            self._conn.execute(
-                "DELETE FROM episodes WHERE timestamp < ?",
-                (cutoff,)
-            )
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    "DELETE FROM episodes WHERE timestamp < ?",
+                    (cutoff,)
+                )
     
     def _init_default_preferences(self) -> None:
         """Initialize default monitoring preferences if they don't exist."""
@@ -200,14 +222,15 @@ class EpisodicMemory:
             "alert_enabled_log": "true",
         }
         
-        with self._conn:
-            for key, value in defaults.items():
-                cursor = self._conn.execute("SELECT key FROM user_prefs WHERE key = ?", (key,))
-                if not cursor.fetchone():
-                    self._conn.execute(
-                        "INSERT INTO user_prefs(key, value, updated_at) VALUES (?, ?, ?)",
-                        (key, value, _timestamp())
-                    )
+        with self._lock:
+            with self._conn:
+                for key, value in defaults.items():
+                    cursor = self._conn.execute("SELECT key FROM user_prefs WHERE key = ?", (key,))
+                    if not cursor.fetchone():
+                        self._conn.execute(
+                            "INSERT INTO user_prefs(key, value, updated_at) VALUES (?, ?, ?)",
+                            (key, value, _timestamp())
+                        )
     
     def get_pref(self, key: str, default: Any = None) -> Any:
         """Get a user preference value.
@@ -222,8 +245,9 @@ class EpisodicMemory:
         if not self._conn:
             return default
         
-        cursor = self._conn.execute("SELECT value FROM user_prefs WHERE key = ?", (key,))
-        row = cursor.fetchone()
+        with self._lock:
+            cursor = self._conn.execute("SELECT value FROM user_prefs WHERE key = ?", (key,))
+            row = cursor.fetchone()
         if not row:
             return default
         
@@ -261,15 +285,16 @@ class EpisodicMemory:
             return
         
         value_str = str(value)
-        with self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO user_prefs(key, value, updated_at) 
-                VALUES (?, ?, ?)
-                ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?
-                """,
-                (key, value_str, _timestamp(), value_str, _timestamp())
-            )
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO user_prefs(key, value, updated_at) 
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?
+                    """,
+                    (key, value_str, _timestamp(), value_str, _timestamp())
+                )
     
     def get_all_prefs(self) -> Dict[str, Any]:
         """Get all user preferences.
@@ -280,12 +305,13 @@ class EpisodicMemory:
         if not self._conn:
             return {}
         
-        cursor = self._conn.execute("SELECT key, value FROM user_prefs")
-        prefs = {}
-        for row in cursor.fetchall():
-            key = row[0]
-            value = row[1]
-            prefs[key] = self.get_pref(key, value)
+        with self._lock:
+            cursor = self._conn.execute("SELECT key, value FROM user_prefs")
+            prefs = {}
+            for row in cursor.fetchall():
+                key = row[0]
+                value = row[1]
+                prefs[key] = self.get_pref(key, value)
         
         return prefs
 
@@ -294,6 +320,17 @@ class MemoryManager:
     def __init__(self, working_capacity: int = 20, db_path: Optional[Path] = None) -> None:
         self.working = WorkingMemory(working_capacity)
         self.episodic = EpisodicMemory(db_path)
+
+    @staticmethod
+    async def _run_in_executor(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+        """Execute a blocking storage helper in the default executor.
+
+        Ensures expensive sqlite operations never block the asyncio event
+        loop while keeping the calling signature consistent with the
+        synchronous helpers.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, partial(func, *args, **kwargs))
 
     def __enter__(self) -> "MemoryManager":
         return self
@@ -313,6 +350,10 @@ class MemoryManager:
 
     def save_fact(self, fact: str, metadata: Optional[Dict[str, object]] = None) -> None:
         self.episodic.add(fact, metadata)
+
+    async def save_fact_async(self, fact: str, metadata: Optional[Dict[str, object]] = None) -> None:
+        """Async wrapper for :meth:`save_fact`."""
+        await self._run_in_executor(self.save_fact, fact, metadata)
 
     def recent_observations(self, limit: int = 5) -> List[str]:
         return self.working.recent_observations(limit)
@@ -335,6 +376,10 @@ class MemoryManager:
             formatted.append(f"{timestamp}: {fact}")
         return formatted
 
+    async def recall_relevant_async(self, context: Dict[str, object], limit: int = 5) -> List[str]:
+        """Async wrapper for :meth:`recall_relevant`."""
+        return await self._run_in_executor(self.recall_relevant, context, limit)
+
     def close(self) -> None:
         if self.episodic:
             self.episodic.close()
@@ -343,18 +388,34 @@ class MemoryManager:
         """Remove episodes older than N days."""
         if self.episodic:
             self.episodic.cleanup_old_episodes(days_to_keep)
+
+    async def cleanup_old_episodes_async(self, days_to_keep: int = 30) -> None:
+        """Async wrapper for :meth:`cleanup_old_episodes`."""
+        await self._run_in_executor(self.cleanup_old_episodes, days_to_keep)
     
     def get_pref(self, key: str, default: Any = None) -> Any:
         """Get a user preference value."""
         return self.episodic.get_pref(key, default)
+
+    async def get_pref_async(self, key: str, default: Any = None) -> Any:
+        """Async wrapper for :meth:`get_pref`."""
+        return await self._run_in_executor(self.get_pref, key, default)
     
     def set_pref(self, key: str, value: Any) -> None:
         """Set a user preference value."""
         self.episodic.set_pref(key, value)
+
+    async def set_pref_async(self, key: str, value: Any) -> None:
+        """Async wrapper for :meth:`set_pref`."""
+        await self._run_in_executor(self.set_pref, key, value)
     
     def get_all_prefs(self) -> Dict[str, Any]:
         """Get all user preferences."""
         return self.episodic.get_all_prefs()
+
+    async def get_all_prefs_async(self) -> Dict[str, Any]:
+        """Async wrapper for :meth:`get_all_prefs`."""
+        return await self._run_in_executor(self.get_all_prefs)
     
     def get_vector_memory(self):
         """Get vector memory instance if available."""

@@ -11,7 +11,10 @@ import os
 import queue
 import threading
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - type checking only
+    from modules.memory_manager import MemoryManager
 
 LOGGER = logging.getLogger(__name__)
 
@@ -36,10 +39,51 @@ class DialogueEntry:
     author: str = "Shimeji"
 
 
+def ensure_clipboard_permission(
+    memory_manager: Optional["MemoryManager"],
+    prompt_callback: Callable[[], Tuple[bool, bool]],
+) -> Tuple[bool, str]:
+    """Return whether clipboard access is allowed and the final consent state.
+
+    Args:
+        memory_manager: Shared memory manager used to persist consent decisions.
+        prompt_callback: Callable returning (allowed, remember_choice) when user
+            is prompted.
+
+    Returns:
+        Tuple of (allowed flag, resulting preference string).
+    """
+
+    consent_pref = "ask"
+    if memory_manager is not None:
+        try:
+            stored_pref = memory_manager.get_pref("clipboard_consent", "ask")
+            if isinstance(stored_pref, str) and stored_pref:
+                consent_pref = stored_pref.lower()
+        except Exception as exc:  # pragma: no cover - defensive logging only
+            LOGGER.debug("Clipboard consent lookup failed: %s", exc)
+
+    if consent_pref == "allow":
+        return True, consent_pref
+    if consent_pref == "deny":
+        return False, consent_pref
+
+    allowed, remember_choice = prompt_callback()
+    final_pref = consent_pref
+    if remember_choice and memory_manager is not None:
+        final_pref = "allow" if allowed else "deny"
+        try:
+            memory_manager.set_pref("clipboard_consent", final_pref)
+        except Exception as exc:  # pragma: no cover - defensive logging only
+            LOGGER.debug("Failed to persist clipboard consent: %s", exc)
+
+    return allowed, final_pref
+
+
 class SpeechBubbleOverlay:
     """Threaded Qt overlay that displays queued dialogue snippets AND a persistent chat panel."""
 
-    def __init__(self) -> None:
+    def __init__(self, memory_manager: Optional["MemoryManager"] = None) -> None:
         self._queue: "queue.Queue[DialogueEntry]" = queue.Queue()
         self._thread: Optional[threading.Thread] = None
         self._started = threading.Event()
@@ -49,6 +93,9 @@ class SpeechBubbleOverlay:
         self._anchor_lock = threading.Lock()
         self._anchor: Optional[Tuple[float, float]] = None
         self._state_machine: Optional[Any] = None  # MascotStateMachine instance
+        self._memory_manager: Optional["MemoryManager"] = memory_manager
+        self._owns_memory_manager = False
+        self._alerts_memory_manager: Optional["MemoryManager"] = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -63,6 +110,14 @@ class SpeechBubbleOverlay:
         if self._thread and self._thread.is_alive():
             self._queue.put(DialogueEntry("", 0))
             self._thread.join(timeout=5)
+        if self._owns_memory_manager and self._memory_manager:
+            try:
+                self._memory_manager.close()
+            except Exception as exc:
+                LOGGER.debug("Failed to close owned memory manager: %s", exc)
+            finally:
+                self._memory_manager = None
+                self._owns_memory_manager = False
 
     def enqueue(self, messages: Iterable[Dict[str, str]]) -> None:
         for message in messages:
@@ -105,6 +160,24 @@ class SpeechBubbleOverlay:
         with self._anchor_lock:
             return self._anchor
 
+    def _ensure_memory_manager(self) -> Optional["MemoryManager"]:
+        """Return a memory manager instance for alert preferences."""
+        if self._alerts_memory_manager is not None:
+            return self._alerts_memory_manager
+        if self._memory_manager is not None:
+            self._alerts_memory_manager = self._memory_manager
+            return self._alerts_memory_manager
+        try:
+            from modules.memory_manager import MemoryManager
+
+            self._memory_manager = MemoryManager()
+            self._owns_memory_manager = True
+            self._alerts_memory_manager = self._memory_manager
+        except Exception as exc:  # pragma: no cover - database init errors
+            LOGGER.error("Failed to initialize memory manager: %s", exc)
+            self._alerts_memory_manager = None
+        return self._alerts_memory_manager
+
     # ------------------------------------------------------------------
     # Qt Event Loop (executed in background thread)
     # ------------------------------------------------------------------
@@ -121,6 +194,7 @@ class SpeechBubbleOverlay:
                 QLabel,
                 QLineEdit,
                 QMenu,
+                QMessageBox,
                 QPushButton,
                 QTextEdit,
                 QVBoxLayout,
@@ -380,12 +454,12 @@ class SpeechBubbleOverlay:
             
             def _setup_alerts_menu(self) -> None:
                 """Set up the monitoring alerts dropdown menu with checkboxes."""
-                try:
-                    from modules.memory_manager import MemoryManager
-                    self._memory_manager = MemoryManager()
-                except Exception as exc:
-                    LOGGER.error("Failed to initialize memory manager for alerts menu: %s", exc)
+                memory_manager = overlay_ref._ensure_memory_manager()
+                if memory_manager is None:
+                    LOGGER.error("Monitoring alerts menu unavailable: memory manager missing")
+                    self.append_message("System", "Monitoring preferences unavailable right now")
                     return
+                self._memory_manager = memory_manager
                 
                 # Alert types with their preference keys and display names
                 alert_types = [
@@ -420,17 +494,50 @@ class SpeechBubbleOverlay:
                     action.triggered.connect(make_toggle_handler(alert_type, display_name))
                     self._alert_checkboxes[alert_type] = action
             
+            def _prompt_clipboard_access(self) -> Tuple[bool, bool]:
+                """Show consent dialog and return (allowed, remember_choice)."""
+                msg_box = QMessageBox(self)
+                msg_box.setIcon(QMessageBox.Icon.Warning)
+                msg_box.setWindowTitle("Allow Clipboard Access?")
+                msg_box.setText(
+                    "Shimeji can only read your clipboard if you explicitly allow it.\n"
+                    "Clipboard contents may include passwords or other private data."
+                )
+                msg_box.setInformativeText("Do you want to share the current clipboard content right now?")
+                msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                msg_box.setDefaultButton(QMessageBox.StandardButton.No)
+                remember_box = QCheckBox("Remember my choice")
+                msg_box.setCheckBox(remember_box)
+                result = msg_box.exec()
+                return result == QMessageBox.StandardButton.Yes, remember_box.isChecked()
+
             def _on_clipboard_clicked(self) -> None:
-                """Read clipboard and ask Gemini about it."""
+                """Read clipboard and ask Gemini about it after explicit consent."""
+                memory_manager = getattr(self, "_memory_manager", None)
+                allowed, final_pref = ensure_clipboard_permission(
+                    memory_manager,
+                    self._prompt_clipboard_access,
+                )
+                if not allowed:
+                    if final_pref == "deny":
+                        self.append_message(
+                            "System",
+                            "Clipboard access is disabled. Update monitoring preferences to re-enable it.",
+                        )
+                    else:
+                        self.append_message("System", "Clipboard access cancelled.")
+                    return
+
                 try:
                     from modules.productivity_tools import ProductivityTools
                     clipboard_content = ProductivityTools.read_clipboard()
                     if clipboard_content:
-                        # Show what was copied
                         preview = clipboard_content[:200] + "..." if len(clipboard_content) > 200 else clipboard_content
                         self.append_message("You", f"[Clipboard] {preview}")
-                        # Ask Gemini about it
-                        prompt = f"Here's what I copied to my clipboard:\n\n{clipboard_content[:5000]}\n\nCan you help me with this?"
+                        prompt = (
+                            "Here's what I copied to my clipboard:\n\n"
+                            f"{clipboard_content[:5000]}\n\nCan you help me with this?"
+                        )
                         if overlay_ref._prompt_sender:
                             try:
                                 overlay_ref._prompt_sender(prompt)

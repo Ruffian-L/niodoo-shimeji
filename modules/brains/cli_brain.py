@@ -77,7 +77,7 @@ class CLIBrain:
         while iteration < max_iterations:
             iteration += 1
             start_time = time.monotonic()
-            
+
             def _call():
                 return self._model.generate_content(
                     self._history,
@@ -86,9 +86,22 @@ class CLIBrain:
                         "max_output_tokens": 8192,  # Increased for long document analysis
                     }
                 )
-            
-            response = await loop.run_in_executor(None, _call)
-            duration = time.monotonic() - start_time
+
+            try:
+                response = await loop.run_in_executor(None, _call)
+                duration = time.monotonic() - start_time
+
+                # Record success for circuit breaker
+                if self._rate_limiter:
+                    self._rate_limiter.record_success()
+            except Exception as exc:
+                duration = time.monotonic() - start_time
+
+                # Record failure for circuit breaker
+                if self._rate_limiter:
+                    self._rate_limiter.record_failure(exc)
+
+                raise
             
             # Record metrics if agent available
             if hasattr(self, '_agent') and self._agent and hasattr(self._agent, '_metrics'):
@@ -147,7 +160,8 @@ class CLIBrain:
                         else:
                             # For other functions, execute via agent (they handle their own display)
                             decision = ProactiveDecision(fc.name, dict(fc.args))
-                            await agent._execute_decision(decision, agent._latest_context)
+                            context_snapshot = await agent.get_latest_context()
+                            await agent._execute_decision(decision, context_snapshot)
                             
                             # Create generic response for chaining
                             function_response_parts.append({

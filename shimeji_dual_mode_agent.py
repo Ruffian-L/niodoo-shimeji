@@ -33,6 +33,20 @@ from google.generativeai import types as genai_types
 import random
 import signal
 
+from modules.constants import (
+    DEFAULT_ANCHOR_POLL_SECONDS,
+    DEFAULT_FLASH_MODEL,
+    DEFAULT_LISTEN_HOST,
+    DEFAULT_LISTEN_PORT,
+    DEFAULT_MEMORY_CLEANUP_INTERVAL_SECONDS,
+    DEFAULT_PERSONALITY,
+    DEFAULT_PROACTIVE_INTERVAL_SECONDS,
+    DEFAULT_PRO_MODEL,
+    DEFAULT_REACTION_INTERVAL_SECONDS,
+    DEFAULT_STARTUP_DELAY_SECONDS,
+    DEFAULT_VISION_ANALYSIS_INTERVAL_SECONDS,
+    MIN_STARTUP_DELAY_SECONDS,
+)
 from modules.context_sniffer import ContextSniffer
 from modules.desktop_controller import DesktopController
 from modules.privacy_filter import PrivacyFilter
@@ -48,58 +62,46 @@ from modules.structured_logger import StructuredLogger
 from modules.decision_executor import DecisionExecutor
 from modules.event_bus import EventBus, EventType
 from modules.system_monitor import MonitoringManager, SystemAlert, AlertSeverity
+from modules.metrics import PerformanceMetrics
+from modules.invocation_server import InvocationServer
+from modules.context_manager import ContextManager
+from modules.dialogue_manager import DialogueManager
+from modules.file_handler import FileHandler
+from modules.genai_utils import get_cached_model
+from modules.input_sanitizer import InputSanitizer
 
 LOGGER = logging.getLogger(__name__)
 
 
-@dataclass
-class PerformanceMetrics:
-    """Performance metrics collection for monitoring."""
-    api_call_times: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
-    decision_times: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
-    context_updates: int = 0
-    errors: int = 0
-    
-    def record_api_call(self, duration: float) -> None:
-        """Record an API call duration."""
-        self.api_call_times.append(duration)
-    
-    def record_decision(self, duration: float) -> None:
-        """Record a decision-making duration."""
-        self.decision_times.append(duration)
-    
-    def record_context_update(self) -> None:
-        """Record a context update."""
-        self.context_updates += 1
-    
-    def record_error(self) -> None:
-        """Record an error."""
-        self.errors += 1
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get performance statistics."""
-        return {
-            "avg_api_time_ms": (
-                sum(self.api_call_times) / len(self.api_call_times) * 1000
-                if self.api_call_times else 0
-            ),
-            "avg_decision_time_ms": (
-                sum(self.decision_times) / len(self.decision_times) * 1000
-                if self.decision_times else 0
-            ),
-            "total_context_updates": self.context_updates,
-            "total_errors": self.errors,
-            "api_call_count": len(self.api_call_times),
-            "decision_count": len(self.decision_times),
-        }
-DEFAULT_FLASH_MODEL = "gemini-2.5-flash"
-DEFAULT_PRO_MODEL = "gemini-2.5-pro"
-DEFAULT_PERSONALITY = "playful_helper"
-DEFAULT_PROACTIVE_INTERVAL = 45
-DEFAULT_REACTION_INTERVAL = 10
-DEFAULT_LISTEN_HOST = "127.0.0.1"
-DEFAULT_LISTEN_PORT = 8770
-DEFAULT_ANCHOR_POLL = 0.25
+
+_SIGCHLD_HANDLER_INSTALLED = False
+
+
+def _reap_child_processes(signum, frame) -> None:
+    """Reap finished child processes to avoid zombies."""
+    try:
+        while True:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+            if pid == 0:
+                break
+    except ChildProcessError:
+        pass
+    except OSError as exc:
+        if exc.errno != errno.ECHILD:
+            LOGGER.debug("SIGCHLD waitpid failed: %s", exc)
+
+
+def _ensure_sigchld_handler_registered() -> None:
+    """Register a SIGCHLD handler once in the parent process."""
+    global _SIGCHLD_HANDLER_INSTALLED
+    if _SIGCHLD_HANDLER_INSTALLED or not hasattr(signal, "SIGCHLD"):
+        return
+    try:
+        signal.signal(signal.SIGCHLD, _reap_child_processes)
+        _SIGCHLD_HANDLER_INSTALLED = True
+    except (OSError, ValueError) as exc:
+        LOGGER.debug("Unable to register SIGCHLD handler: %s", exc)
+
 
 BEHAVIOUR_DESCRIPTIONS = {
     "SitAndFaceMouse": "sit here and keep an eye on your cursor",
@@ -134,11 +136,13 @@ def validate_api_key(key: str) -> bool:
     Returns:
         True if the key appears valid, False otherwise
     """
-    if not key or len(key) < 20:
+    if not key:
         return False
-    # Gemini keys are typically base64-like strings
-    # Basic format check: should contain alphanumeric characters and possibly hyphens
-    if not re.match(r"^[A-Za-z0-9_-]+$", key):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
+        return False
+    if not key.startswith("AIza"):
+        return False
+    if len(key) != 39:
         return False
     return True
 
@@ -167,6 +171,8 @@ def ensure_shimeji_running() -> None:
         LOGGER.warning("Shijima binary not found at %s; skipping auto-launch", binary)
         return
 
+    _ensure_sigchld_handler_registered()
+
     try:
         proc = subprocess.run(["pgrep", "-f", binary], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if proc.returncode == 0:
@@ -176,20 +182,52 @@ def ensure_shimeji_running() -> None:
 
     LOGGER.info("Starting Shijima-Qt from %s", binary)
     try:
-        # Detach process to prevent zombie processes when it exits
-        # Use start_new_session=True to create a new process group
-        # This ensures the child doesn't become a zombie if parent doesn't wait
-        proc = subprocess.Popen(
-            [binary],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True  # Detach from parent process group
-        )
-        # Don't wait for the process - let it run independently
-        # The process is detached so it won't become a zombie
-        delay = float(os.getenv("SHIMEJI_STARTUP_DELAY", "1.0"))
-        time.sleep(max(0.0, delay))
+        # Use double-fork to completely detach process and prevent zombies
+        # First fork: create child process
+        pid = os.fork()
+        if pid == 0:
+            # In child process - fork again to create grandchild
+            try:
+                # Create new session to detach from terminal
+                os.setsid()
+                # Second fork: create grandchild that will be adopted by init
+                pid2 = os.fork()
+                if pid2 == 0:
+                    # In grandchild - this will be adopted by init (PID 1)
+                    # Execute the binary
+                    os.execv(binary, [binary])
+                else:
+                    # In first child - exit immediately, letting grandchild be adopted by init
+                    os._exit(0)
+            except Exception as exc:
+                LOGGER.error("Failed to fork Shijima-Qt process: %s", exc)
+                os._exit(1)
+        else:
+            # In parent process - wait for first child to exit
+            # This prevents the first child from becoming a zombie
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError as exc:
+                LOGGER.debug("Child process %s already reaped: %s", pid, exc)
+            # The grandchild is now running independently, adopted by init
+            # It won't become a zombie when it exits because init reaps all children
+        
+        delay = float(os.getenv("SHIMEJI_STARTUP_DELAY", str(DEFAULT_STARTUP_DELAY_SECONDS)))
+        time.sleep(max(MIN_STARTUP_DELAY_SECONDS, delay))
+    except OSError as exc:
+        # Fallback to subprocess.Popen if fork is not available (Windows)
+        LOGGER.debug("Fork not available, using subprocess.Popen: %s", exc)
+        try:
+            proc = subprocess.Popen(
+                [binary],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                preexec_fn=os.setsid if hasattr(os, 'setsid') else None,
+            )
+        except Exception as exc2:
+            LOGGER.warning("Failed to launch Shijima-Qt (%s): %s", binary, exc2)
     except Exception as exc:
         LOGGER.warning("Failed to launch Shijima-Qt (%s): %s", binary, exc)
 
@@ -221,116 +259,7 @@ from modules.brains import ProactiveBrain, CLIBrain, ProactiveDecision, RateLimi
 DEFAULT_FUNCTION_DECLARATIONS = build_proactive_function_declarations([])
 
 
-class InvocationServer:
-    """Simple TCP JSON server for CLI invocation."""
 
-    def __init__(self, agent: "DualModeAgent", host: str, port: int):
-        self._agent = agent
-        self._host = host
-        self._port = port
-        self._server: Optional[asyncio.AbstractServer] = None
-
-    async def start(self) -> None:
-        if self._server is not None:
-            return
-
-        port = self._port
-        attempts = int(os.getenv("CLI_PORT_ATTEMPTS", "10"))
-        last_exc: Optional[Exception] = None
-
-        for _ in range(max(1, attempts)):
-            try:
-                self._server = await asyncio.start_server(
-                    self._handle_connection, self._host, port
-                )
-                self._port = port
-                break
-            except OSError as exc:
-                last_exc = exc
-                if exc.errno == errno.EADDRINUSE:
-                    port += 1
-                    continue
-                raise
-        else:
-            raise last_exc  # type: ignore[misc]
-
-        addrs = ", ".join(str(sock.getsockname()) for sock in self._server.sockets)
-        LOGGER.info("CLI invocation server listening on %s", addrs)
-
-    async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
-            data = await reader.read(65536)
-            request_text = data.decode("utf-8").strip()
-            
-            # Check if this is a health check request
-            if request_text == "HEALTH" or request_text.startswith("GET /health"):
-                health_response = await self._handle_health_check()
-                writer.write(json.dumps(health_response).encode("utf-8"))
-                await writer.drain()
-                writer.close()
-                await writer.wait_closed()
-                return
-            
-            # Otherwise, treat as CLI request
-            request = json.loads(request_text)
-            prompt = request.get("prompt", "").strip()
-            if not prompt:
-                LOGGER.warning("Received CLI invocation without prompt")
-                response = {"error": "prompt required"}
-            else:
-                response_text = await self._agent.handle_cli_request(prompt)
-                response = {"response": response_text}
-        except json.JSONDecodeError:
-            response = {"error": "invalid JSON"}
-        except Exception as exc:  # pragma: no cover - network runtime
-            LOGGER.exception("Error handling CLI invocation: %s", exc)
-            response = {"error": str(exc)}
-
-        writer.write(json.dumps(response).encode("utf-8"))
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
-    
-    async def _handle_health_check(self) -> Dict[str, Any]:
-        """Handle health check requests."""
-        agent = self._agent
-        start_time = getattr(agent, '_start_time', None)
-        uptime = time.monotonic() - start_time if start_time else 0
-        
-        try:
-            mascots = agent.desktop_controller.list_mascots()
-            mascot_available = len(mascots) > 0
-        except Exception:
-            mascot_available = False
-        
-        try:
-            memory_episodes = len(agent.memory.episodic.recent(limit=1000))
-        except Exception:
-            memory_episodes = 0
-        
-        health = {
-            "status": "healthy" if agent._running else "stopped",
-            "mode": agent.mode.name,
-            "mascot_available": mascot_available,
-            "memory_episodes": memory_episodes,
-            "uptime_seconds": round(uptime, 2),
-        }
-        
-        # Add metrics if available
-        if hasattr(agent, 'get_metrics'):
-            try:
-                metrics = agent.get_metrics()
-                health["metrics"] = metrics
-            except Exception:
-                pass
-        
-        return health
-
-    async def stop(self) -> None:
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
 
 
 class DualModeAgent:
@@ -342,8 +271,8 @@ class DualModeAgent:
         flash_model: str = DEFAULT_FLASH_MODEL,
         pro_model: str = DEFAULT_PRO_MODEL,
         personality: str = DEFAULT_PERSONALITY,
-        proactive_interval: int = DEFAULT_PROACTIVE_INTERVAL,
-        reaction_interval: int = DEFAULT_REACTION_INTERVAL,
+        proactive_interval: int = DEFAULT_PROACTIVE_INTERVAL_SECONDS,
+        reaction_interval: int = DEFAULT_REACTION_INTERVAL_SECONDS,
         listen_host: str = DEFAULT_LISTEN_HOST,
         listen_port: int = DEFAULT_LISTEN_PORT,
     ) -> None:
@@ -401,36 +330,47 @@ class DualModeAgent:
         
         # Create event bus
         self._event_bus = EventBus()
-        
+
         # Create performance metrics
         self._metrics = PerformanceMetrics()
-        
+
+        # Create managers
+        self._context_manager = ContextManager(self.privacy_filter, self.memory, self._event_bus, self._metrics)
+        # Initialize overlay before creating the dialogue manager so the
+        # manager always receives a valid overlay reference. This avoids an
+        # AttributeError when `DialogueManager` tries to access `overlay`.
+        self.overlay = SpeechBubbleOverlay(memory_manager=self.memory)
+        self._dialogue_manager = DialogueManager(self.desktop_controller, self.overlay)
+        self._file_handler = FileHandler(self.proactive_brain, self.memory, self.emotions, self._execute_decision)
+
+        # Ensure recent actions deque exists before passing it to the file handler
+        # (the file handler expects a list of recent actions; if this is not
+        # yet initialized an AttributeError will be raised). Initialize here so
+        # it's available to other components at startup.
+        self._recent_actions: Deque[str] = deque(maxlen=20)
+        self._file_handler.set_context(self._latest_context, list(self._recent_actions))
+
         self.mode = AgentMode.PROACTIVE
         self._mode_lock = asyncio.Lock()
-        self._latest_context: Dict[str, Any] = {
-            "title": "Unknown",
-            "application": "Unknown",
-            "pid": -1,
-            "source": "initial",
-        }
-        self._context_changed: Optional[asyncio.Event] = None
+        self._context_lock: Optional[asyncio.Lock] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._unsubscribe_callback = None
         self._proactive_interval = proactive_interval
         self._reaction_interval = reaction_interval
         self._next_interval = proactive_interval
         self._running = False
         self._proactive_task: Optional[asyncio.Task[None]] = None
         self._invocation_server = InvocationServer(self, listen_host, listen_port)
-        self._recent_actions: Deque[str] = deque(maxlen=20)
-        self.overlay = SpeechBubbleOverlay()
+        # Configure overlay callbacks and references
         self.overlay.set_prompt_sender(self._submit_cli_prompt)
         self.overlay._agent_ref = self  # Store agent reference for event bus access (P2.4)
         self._greeting_shown = False  # Flag to prevent duplicate greetings
         try:
-            self._anchor_poll_interval = max(0.1, float(os.getenv("SHIMEJI_ANCHOR_POLL", "0.5")))
+            self._anchor_poll_interval = max(
+                0.1,
+                float(os.getenv("SHIMEJI_ANCHOR_POLL", str(DEFAULT_ANCHOR_POLL_SECONDS))),
+            )
         except ValueError:
-            self._anchor_poll_interval = 0.5
+            self._anchor_poll_interval = DEFAULT_ANCHOR_POLL_SECONDS
         self._anchor_task: Optional[asyncio.Task[None]] = None
         self._cleanup_task: Optional[asyncio.Task[None]] = None
         self._config_watcher_task: Optional[asyncio.Task[None]] = None
@@ -486,9 +426,11 @@ class DualModeAgent:
     # ------------------------------------------------------------------
     async def _cleanup_loop(self) -> None:
         """Periodically clean up old episodic memories."""
-        cleanup_interval = 3600  # Run every hour
+        cleanup_interval = DEFAULT_MEMORY_CLEANUP_INTERVAL_SECONDS  # Run every hour
         try:
-            cleanup_interval = int(os.getenv("MEMORY_CLEANUP_INTERVAL", "3600"))
+            cleanup_interval = int(
+                os.getenv("MEMORY_CLEANUP_INTERVAL", str(DEFAULT_MEMORY_CLEANUP_INTERVAL_SECONDS))
+            )
         except ValueError:
             pass
         
@@ -503,7 +445,7 @@ class DualModeAgent:
             if not self._running:
                 break
             try:
-                self.memory.cleanup_old_episodes(days_to_keep=days_to_keep)
+                await self.memory.cleanup_old_episodes_async(days_to_keep=days_to_keep)
                 LOGGER.debug("Cleaned up old episodic memories (kept last %d days)", days_to_keep)
             except Exception as exc:
                 LOGGER.warning("Memory cleanup failed: %s", exc)
@@ -515,8 +457,9 @@ class DualModeAgent:
         self._running = True
         self._start_time = time.monotonic()
         self._loop = asyncio.get_running_loop()
-        self._context_changed = asyncio.Event()
-        
+        if self._context_lock is None:
+            self._context_lock = asyncio.Lock()
+
         # Start config watcher if watchdog is available
         try:
             import watchdog
@@ -525,15 +468,7 @@ class DualModeAgent:
             LOGGER.debug("watchdog not available; config hot reload disabled")
             self._config_watcher_task = None
 
-        def _context_callback(raw_context: Dict[str, Any]) -> None:
-            sanitised = self.privacy_filter.sanitise_context(raw_context)
-            if self._loop is None:
-                return
-            self._loop.call_soon_threadsafe(self._update_context, sanitised)
-
-        self._unsubscribe_callback = self.context_sniffer.subscribe(_context_callback)
-        # Seed context immediately.
-        self._update_context(self.context_sniffer.get_current_context())
+        self._context_manager.start(self._loop)
 
         self.overlay.start()
         self.overlay.update_anchor(None, None)
@@ -558,7 +493,7 @@ class DualModeAgent:
                     "I'm awake and ready to help! 🚀\n\n"
                     "• Ask me to run bash commands or help with tasks\n"
                     "• Drag & drop files (images, PDFs, code) into chat for analysis\n"
-                    "• Click the 📋 button to ask about your clipboard\n"
+                    "• Click the 📋 button if you want me to read your clipboard\n"
                     "• I can analyze screenshots, monitor system status, and more!\n\n"
                     "Just type in the chat or click me to get started!"
                 )
@@ -580,7 +515,9 @@ class DualModeAgent:
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         
         # Start vision analysis loop (P2.2)
-        vision_interval = int(os.getenv("VISION_ANALYSIS_INTERVAL", "45"))
+        vision_interval = int(
+            os.getenv("VISION_ANALYSIS_INTERVAL", str(DEFAULT_VISION_ANALYSIS_INTERVAL_SECONDS))
+        )
         if vision_interval > 0:
             self._vision_analysis_task = asyncio.create_task(self._vision_analysis_loop(vision_interval))
         
@@ -641,8 +578,9 @@ class DualModeAgent:
             self._process_pool.shutdown(wait=True)
             self._process_pool = None
         
-        if self._unsubscribe_callback:
-            self._unsubscribe_callback()
+        # Stop context manager
+        self._context_manager.stop()
+
         if hasattr(self, '_permission_manager') and self._permission_manager:
             self._permission_manager.close()
         self.memory.close()
@@ -651,17 +589,69 @@ class DualModeAgent:
 
     # ------------------------------------------------------------------
     def _update_context(self, context: Dict[str, Any]) -> None:
-        self._latest_context = context
-        self.memory.record_observation(context)
-        if self._context_changed is not None:
-            self._context_changed.set()
-        # Record metrics and publish event
-        self._metrics.record_context_update()
-        self._event_bus.publish(EventType.CONTEXT_CHANGED, context)
-    
+        self._context_manager._update_context(context)
+
+    @property
+    def _latest_context(self) -> Dict[str, Any]:
+        return self._context_manager.latest_context
+
+    @_latest_context.setter
+    def _latest_context(self, value: Dict[str, Any]) -> None:
+        """Allow setting the latest context by delegating to ContextManager.
+
+        This ensures metrics and notifications are correctly recorded and the
+        event bus is triggered when context changes.
+        """
+        # Use the ContextManager API (private method) to perform a full
+        # update with side effects (metrics/event bus). Not ideal to call a
+        # _private method but this is an internal coordination point.
+        self._context_manager._update_context(value)
+
+    @property
+    def _context_changed(self) -> Optional[asyncio.Event]:
+        return self._context_manager.context_changed
+
     def get_metrics(self) -> Dict[str, Any]:
         """Get performance metrics."""
         return self._metrics.get_stats()
+
+    async def _get_context_snapshot(self) -> Dict[str, Any]:
+        """Return a thread-safe copy of the latest context."""
+        if self._context_lock:
+            async with self._context_lock:
+                return self._context_manager.latest_context
+        return self._context_manager.latest_context
+
+    async def _merge_latest_context(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge updates into the latest context under lock."""
+        if self._context_lock:
+            async with self._context_lock:
+                merged = {**self._context_manager.latest_context, **updates}
+                self._context_manager._update_context(merged)
+                return merged
+        merged = {**self._context_manager.latest_context, **updates}
+        self._context_manager._update_context(merged)
+        return merged
+
+    async def get_latest_context(self) -> Dict[str, Any]:
+        """Public helper for collaborators needing the current context."""
+        return await self._get_context_snapshot()
+
+    def _parse_vision_analysis(self, analysis: str) -> Optional[Dict[str, Any]]:
+        """Extract JSON payload from a Gemini vision response string."""
+        if "{" not in analysis or "}" not in analysis:
+            return None
+        json_start = analysis.find("{")
+        json_end = analysis.rfind("}")
+        if json_start == -1 or json_end == -1 or json_end <= json_start:
+            return None
+        json_str = analysis[json_start:json_end + 1]
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError as exc:
+            LOGGER.warning("Vision analysis JSON decode failed: %s", exc)
+            LOGGER.debug("Vision analysis payload: %s", analysis)
+            return None
     
     async def _watch_config(self) -> None:
         """Watch for configuration file changes."""
@@ -748,7 +738,7 @@ class DualModeAgent:
         
         try:
             # Build context for proactive decision
-            context = self._latest_context.copy()
+            context = await self._get_context_snapshot()
             context["system_alert"] = {
                 "type": alert.alert_type,
                 "message": alert.message,
@@ -757,7 +747,7 @@ class DualModeAgent:
             
             # Get current system state
             working_summary = self.memory.recent_observations()
-            episodic_summary = self.memory.recall_relevant(context)
+            episodic_summary = await self.memory.recall_relevant_async(context)
             
             # Make proactive decision with alert context
             decision = await self.proactive_brain.decide(
@@ -834,64 +824,25 @@ class DualModeAgent:
     
     def _on_file_dropped(self, data: Any) -> None:
         """Handle file drop event (P2.4).
-        
+
         Args:
             data: Event data containing file_path or text
         """
         if not isinstance(data, dict):
             return
-        
-        file_path = data.get("file_path")
-        text = data.get("text")
-        source = data.get("source", "unknown")
-        
+
+        # Update file handler context
+        self._file_handler.set_context(self._latest_context, list(self._recent_actions))
+
         # Route to proactive agent if idle, or reactive agent if chat active
         if self.mode == AgentMode.PROACTIVE:
             # Trigger proactive analysis
-            asyncio.create_task(self._handle_proactive_file_drop(file_path, text))
+            asyncio.create_task(self._file_handler.handle_file_drop(data))
         else:
             # In CLI mode, file is already handled by chat window
             LOGGER.debug("File dropped in CLI mode; handled by chat window")
     
-    async def _handle_proactive_file_drop(self, file_path: Optional[str], text: Optional[str]) -> None:
-        """Handle file drop in proactive mode.
-        
-        Args:
-            file_path: Path to dropped file (if file)
-            text: Dropped text (if text)
-        """
-        if file_path:
-            # Analyze file with proactive agent
-            prompt = (
-                f"The user just dropped this file on me: {file_path}\n"
-                "Analyze its content and suggest 3-5 relevant, actionable tool calls "
-                "(e.g., 'Summarize', 'Rename based on content', 'Move to /Documents/Reports')."
-            )
-            try:
-                decision = await self.proactive_brain.decide(
-                    self._latest_context,
-                    self._recent_actions,
-                    self.memory.recent_observations(),
-                    self.memory.recall_relevant(self._latest_context),
-                    self.emotions.snapshot(),
-                )
-                await self._execute_decision(decision, self._latest_context)
-            except Exception as exc:
-                LOGGER.error("Proactive file analysis failed: %s", exc)
-        elif text:
-            # Analyze text snippet
-            prompt = f"The user dropped this text: {text}\nWhat should I do with it?"
-            try:
-                decision = await self.proactive_brain.decide(
-                    self._latest_context,
-                    self._recent_actions,
-                    self.memory.recent_observations(),
-                    self.memory.recall_relevant(self._latest_context),
-                    self.emotions.snapshot(),
-                )
-                await self._execute_decision(decision, self._latest_context)
-            except Exception as exc:
-                LOGGER.error("Proactive text analysis failed: %s", exc)
+
     
     async def _vision_analysis_loop(self, interval: int) -> None:
         """Proactive screen context analysis loop (P2.2).
@@ -909,7 +860,7 @@ class DualModeAgent:
                 if hasattr(self, '_permission_manager') and self._permission_manager:
                     from modules.permission_manager import PermissionScope, PermissionStatus
                     agent_id = "ProactiveBrain"
-                    permission = self._permission_manager.check_permission(
+                    permission = await self._permission_manager.check_permission_async(
                         agent_id, PermissionScope.CONTEXT_VISION_READ_SCREEN
                     )
                     if permission == PermissionStatus.DENY:
@@ -934,25 +885,23 @@ class DualModeAgent:
                 
                 analysis = await self._analyze_image_with_vision(str(screenshot_path), prompt)
                 if analysis:
-                    # Parse structured output
                     try:
-                        import json
-                        # Extract JSON from response
-                        if "{" in analysis and "}" in analysis:
-                            json_start = analysis.find("{")
-                            json_end = analysis.rfind("}") + 1
-                            json_str = analysis[json_start:json_end]
-                            self._latest_vision_analysis = json.loads(json_str)
-                            self._latest_context["vision_analysis"] = self._latest_vision_analysis
-                            
+                        parsed = self._parse_vision_analysis(analysis)
+                        if parsed:
+                            self._latest_vision_analysis = parsed
+                            await self._merge_latest_context({"vision_analysis": parsed})
+
                             # Check for errors (P2.3)
-                            if self._latest_vision_analysis.get("error_text"):
-                                await self._handle_detected_error(self._latest_vision_analysis["error_text"])
+                            if parsed.get("error_text"):
+                                await self._handle_detected_error(parsed["error_text"])
+                        else:
+                            LOGGER.debug("Vision analysis returned unstructured content; caching raw output")
+                            self._latest_vision_analysis = {"raw": analysis}
+                            await self._merge_latest_context({"vision_analysis": self._latest_vision_analysis})
                     except Exception as exc:
-                        LOGGER.debug("Failed to parse vision analysis: %s", exc)
-                        # Store raw analysis
+                        LOGGER.error("Vision analysis parsing error: %s", exc)
                         self._latest_vision_analysis = {"raw": analysis}
-                        self._latest_context["vision_analysis"] = self._latest_vision_analysis
+                        await self._merge_latest_context({"vision_analysis": self._latest_vision_analysis})
                 
             except asyncio.CancelledError:
                 raise
@@ -967,11 +916,10 @@ class DualModeAgent:
             error_text: Extracted error text from vision analysis
         """
         # Trigger high-priority proactive decision
-        context = self._latest_context.copy()
+        context = await self._get_context_snapshot()
         context["detected_error"] = error_text
         
         working_summary = self.memory.recent_observations()
-        episodic_summary = self.memory.recall_relevant(context)
         
         # Specialized prompt for error resolution
         error_prompt = (
@@ -1030,9 +978,9 @@ class DualModeAgent:
                 interval = self._proactive_interval
                 continue
 
-            context_snapshot = self._latest_context.copy()
+            context_snapshot = await self._get_context_snapshot()
             working_summary = self.memory.recent_observations()
-            episodic_summary = self.memory.recall_relevant(context_snapshot)
+            episodic_summary = await self.memory.recall_relevant_async(context_snapshot)
             self.emotions.natural_decay()
             
             # Record decision time
@@ -1152,6 +1100,13 @@ class DualModeAgent:
     def _submit_cli_prompt(self, prompt: str) -> None:
         if not prompt:
             return
+
+        # Sanitize the prompt
+        sanitized_prompt = InputSanitizer.sanitize_prompt(prompt)
+        if not sanitized_prompt:
+            self.overlay.show_chat_message("Gemini", "Your message appears to be empty or invalid after processing.")
+            return
+
         if self._loop is None:
             self.overlay.show_chat_message("Gemini", "I'm not ready yet—try again in a moment.")
             return
@@ -1159,7 +1114,7 @@ class DualModeAgent:
         def _dispatch(p: str) -> None:
             asyncio.create_task(self._process_cli_prompt(p))
 
-        self._loop.call_soon_threadsafe(_dispatch, prompt)
+        self._loop.call_soon_threadsafe(_dispatch, sanitized_prompt)
 
     async def _process_cli_prompt(self, prompt: str) -> None:
         # Check if this is an image analysis request
@@ -1228,7 +1183,7 @@ class DualModeAgent:
             return None
         
         loop = asyncio.get_running_loop()
-        vision_model = genai.GenerativeModel(DEFAULT_PRO_MODEL)
+        vision_model = get_cached_model(DEFAULT_PRO_MODEL)
         
         # Use process pool for blocking operations to avoid freezing UI
         executor = self._process_pool if self._process_pool else None
@@ -1467,23 +1422,7 @@ class DualModeAgent:
         return None
     
     def _dispatch_dialogue(self) -> None:
-        messages = self.desktop_controller.drain_dialogue_queue()
-        for message in messages:
-            text = message.get("text", "").strip()
-            if not text:
-                continue
-            author = message.get("author", "Shimeji")
-            try:
-                duration = int(message.get("duration", 6))
-            except (TypeError, ValueError):
-                duration = 6
-            # Show bubble above Shimeji
-            self.overlay.show_bubble_message(author, text, duration=duration)
-            # Only add to chat panel if it's the initial greeting (to reduce spam)
-            # Proactive dialogue should only show in bubbles, not chat
-            if hasattr(self, '_greeting_shown') and not self._greeting_shown:
-                self.overlay.show_chat_message(author, text)
-                self._greeting_shown = True
+        self._dialogue_manager.dispatch_dialogue()
 
 
 async def main() -> None:
@@ -1511,8 +1450,12 @@ async def main() -> None:
         flash_model=os.getenv("GEMINI_MODEL_NAME", DEFAULT_FLASH_MODEL),
         pro_model=os.getenv("GEMINI_PRO_MODEL", DEFAULT_PRO_MODEL),
         personality=os.getenv("SHIMEJI_PERSONALITY", DEFAULT_PERSONALITY),
-        proactive_interval=int(os.getenv("PROACTIVE_INTERVAL", DEFAULT_PROACTIVE_INTERVAL)),
-        reaction_interval=int(os.getenv("REACTION_INTERVAL", DEFAULT_REACTION_INTERVAL)),
+        proactive_interval=int(
+            os.getenv("PROACTIVE_INTERVAL", str(DEFAULT_PROACTIVE_INTERVAL_SECONDS))
+        ),
+        reaction_interval=int(
+            os.getenv("REACTION_INTERVAL", str(DEFAULT_REACTION_INTERVAL_SECONDS))
+        ),
         listen_host=os.getenv("CLI_HOST", DEFAULT_LISTEN_HOST),
         listen_port=int(os.getenv("CLI_PORT", DEFAULT_LISTEN_PORT)),
     )

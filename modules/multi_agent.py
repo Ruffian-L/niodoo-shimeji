@@ -127,7 +127,7 @@ class MultiAgentCoordinator:
         context = task.context
         
         # Search episodic memory
-        relevant_facts = memory.recall_relevant(context, limit=10)
+        relevant_facts = await memory.recall_relevant_async(context, limit=10)
         
         # Could also use Gemini to research
         # For now, return memory results

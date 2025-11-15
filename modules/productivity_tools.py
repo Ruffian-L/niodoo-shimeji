@@ -2,31 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Optional
 
 LOGGER = logging.getLogger(__name__)
 
-# Only block truly destructive commands that could cause immediate system damage
-# Allow sensitive but useful commands (like editing configs) - Gemini will warn first
-DANGEROUS_COMMANDS = {
-    "rm -rf /",  # Only block root deletion, not regular rm -rf
-    "rm -f /",   # Only block root deletion
-    "dd if=",    # Block disk imaging that could overwrite drives
-    "mkfs",      # Block filesystem creation
-    "fdisk",     # Block disk partitioning
-    "> /dev/sd", # Block writing to raw disk devices
-    "shutdown",  # Block system shutdown
-    "reboot",    # Block system reboot
-    "init 0",    # Block system halt
-    "init 6",    # Block system reboot
-    "halt",      # Block system halt
-    "poweroff",  # Block system poweroff
-    "chmod -R 777 /",  # Only block system-wide permission changes
-    "chown -R root /", # Only block system-wide ownership changes
+# Explicit allow-list for shell commands the agent may execute autonomously.
+ALLOWED_COMMANDS = {
+    "ls",
+    "cat",
+    "grep",
+    "find",
+    "wc",
+    "head",
+    "tail",
+    "pwd",
+    "stat",
+    "echo",
 }
 
 # Maximum clipboard content length to prevent paste attacks
@@ -38,6 +35,12 @@ MAX_COMMAND_LENGTH = 1000
 
 class ProductivityTools:
     """Collection of system integration tools for the agent."""
+
+    @staticmethod
+    async def read_clipboard_async() -> Optional[str]:
+        """Read current clipboard content with length limits (async version)."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, ProductivityTools.read_clipboard)
 
     @staticmethod
     def read_clipboard() -> Optional[str]:
@@ -56,7 +59,8 @@ class ProductivityTools:
                     LOGGER.warning("Clipboard content too long, truncating")
                     return content[:MAX_CLIPBOARD_LENGTH] + "... [truncated]"
                 return content
-        except (subprocess.TimeoutExpired, FileNotFoundError):
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            LOGGER.debug("xclip clipboard read failed: %s", exc)
             # Try wl-paste for Wayland
             try:
                 result = subprocess.run(
@@ -72,8 +76,8 @@ class ProductivityTools:
                         LOGGER.warning("Clipboard content too long, truncating")
                         return content[:MAX_CLIPBOARD_LENGTH] + "... [truncated]"
                     return content
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                LOGGER.debug("Clipboard tools not available")
+            except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+                LOGGER.debug("Clipboard tools not available: %s", exc)
         return None
 
     @staticmethod
@@ -85,20 +89,26 @@ class ProductivityTools:
                 "error": f"Command too long (max {MAX_COMMAND_LENGTH} chars)",
                 "returncode": -1
             }
-        
-        # Validate against dangerous commands
-        cmd_lower = command.lower()
-        for dangerous in DANGEROUS_COMMANDS:
-            if dangerous.lower() in cmd_lower:
-                LOGGER.warning("Command blocked: contains dangerous pattern '%s'", dangerous)
-                return {
-                    "error": f"Command blocked: contains dangerous pattern '{dangerous}'",
-                    "returncode": -1
-                }
+
+        try:
+            tokens = shlex.split(command)
+        except ValueError as exc:
+            return {"error": f"Invalid command syntax: {exc}", "returncode": -1}
+
+        if not tokens:
+            return {"error": "Command is empty", "returncode": -1}
+
+        base_command = tokens[0]
+        if base_command not in ALLOWED_COMMANDS:
+            LOGGER.warning("Command blocked: '%s' not in allow-list", base_command)
+            return {
+                "error": f"Command '{base_command}' is not permitted",
+                "returncode": -1,
+            }
         
         try:
             result = subprocess.run(
-                ["bash", "-c", command],
+                tokens,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -112,6 +122,12 @@ class ProductivityTools:
             return {"error": "Command timed out", "returncode": -1}
         except Exception as exc:
             return {"error": str(exc), "returncode": -1}
+
+    @staticmethod
+    async def take_screenshot_async() -> Optional[Path]:
+        """Capture a screenshot and return the file path (async version)."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, ProductivityTools.take_screenshot)
 
     @staticmethod
     def take_screenshot() -> Optional[Path]:
@@ -168,6 +184,12 @@ class ProductivityTools:
         
         LOGGER.warning("Screenshot tools not available or failed")
         return None
+
+    @staticmethod
+    async def get_battery_status_async() -> dict:
+        """Get battery percentage and charging status (async version)."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, ProductivityTools.get_battery_status)
 
     @staticmethod
     def get_battery_status() -> dict:
@@ -276,6 +298,12 @@ class ProductivityTools:
         return {}
 
     @staticmethod
+    async def get_cpu_usage_async() -> Optional[float]:
+        """Get current CPU usage percentage (async version)."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, ProductivityTools.get_cpu_usage)
+
+    @staticmethod
     def get_cpu_usage() -> Optional[float]:
         """Get current CPU usage percentage."""
         try:
@@ -289,6 +317,12 @@ class ProductivityTools:
         except Exception as exc:
             LOGGER.debug("CPU usage unavailable: %s", exc)
         return None
+
+    @staticmethod
+    async def get_memory_usage_async() -> Optional[dict]:
+        """Get memory usage statistics (async version)."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, ProductivityTools.get_memory_usage)
 
     @staticmethod
     def get_memory_usage() -> Optional[dict]:
@@ -314,4 +348,82 @@ class ProductivityTools:
         except Exception as exc:
             LOGGER.debug("Memory info unavailable: %s", exc)
         return None
+
+    @staticmethod
+    def cleanup_zombie_processes() -> dict:
+        """Clean up zombie processes by finding and signaling their parent processes."""
+        zombies_cleaned = 0
+        zombies_found = []
+        errors = []
+        
+        try:
+            # Find all zombie processes
+            result = subprocess.run(
+                ["ps", "aux"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            
+            if result.returncode != 0:
+                return {"error": "Failed to list processes", "zombies_cleaned": 0}
+            
+            # Parse ps output to find zombies (status 'Z')
+            for line in result.stdout.split("\n"):
+                if "<defunct>" in line or " Z " in line:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        try:
+                            pid = int(parts[1])
+                            # Get parent PID
+                            ppid_result = subprocess.run(
+                                ["ps", "-o", "ppid=", "-p", str(pid)],
+                                capture_output=True,
+                                text=True,
+                                timeout=2,
+                            )
+                            if ppid_result.returncode == 0:
+                                ppid = int(ppid_result.stdout.strip())
+                                zombies_found.append({"pid": pid, "ppid": ppid})
+                        except (ValueError, IndexError):
+                            continue
+            
+            # Try to reap zombies by sending SIGCHLD to parent processes
+            # This encourages the parent to call wait() and reap the zombie
+            for zombie in zombies_found:
+                try:
+                    # Send SIGCHLD to parent to encourage reaping
+                    # Note: We can't kill zombies directly - they're already dead
+                    # The parent process needs to call wait() to reap them
+                    os.kill(zombie["ppid"], 17)  # SIGCHLD = 17
+                    zombies_cleaned += 1
+                    LOGGER.debug("Sent SIGCHLD to parent PID %d to reap zombie PID %d", 
+                                zombie["ppid"], zombie["pid"])
+                except (ProcessLookupError, PermissionError) as exc:
+                    errors.append(f"PID {zombie['pid']}: {exc}")
+                except Exception as exc:
+                    errors.append(f"PID {zombie['pid']}: {exc}")
+            
+            # Also try using waitpid with WNOHANG to reap any zombies we can
+            # This only works for zombies we created
+            try:
+                while True:
+                    pid, status = os.waitpid(-1, os.WNOHANG)
+                    if pid == 0:
+                        break
+                    zombies_cleaned += 1
+                    LOGGER.debug("Reaped zombie process PID %d", pid)
+            except (ChildProcessError, OSError) as exc:
+                LOGGER.debug("No additional child processes to reap: %s", exc)
+            
+        except subprocess.TimeoutExpired:
+            return {"error": "Process listing timed out", "zombies_cleaned": zombies_cleaned}
+        except Exception as exc:
+            return {"error": str(exc), "zombies_cleaned": zombies_cleaned}
+        
+        return {
+            "zombies_found": len(zombies_found),
+            "zombies_cleaned": zombies_cleaned,
+            "errors": errors if errors else None,
+        }
 

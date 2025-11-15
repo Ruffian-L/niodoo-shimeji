@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sqlite3
+import threading
 from enum import Enum
+from functools import partial
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional, TypeVar
 
 LOGGER = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 class PermissionScope(Enum):
@@ -51,6 +56,7 @@ class PermissionManager:
         )
         if self._conn:
             self._conn.row_factory = sqlite3.Row
+        self._lock = threading.RLock()
         self._initialize()
     
     def _initialize(self) -> None:
@@ -58,18 +64,25 @@ class PermissionManager:
         if not self._conn:
             return
         
-        with self._conn:
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS permissions (
-                    agent_id TEXT NOT NULL,
-                    scope TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK(status IN ('ask', 'allow', 'deny')),
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (agent_id, scope)
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS permissions (
+                        agent_id TEXT NOT NULL,
+                        scope TEXT NOT NULL,
+                        status TEXT NOT NULL CHECK(status IN ('ask', 'allow', 'deny')),
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (agent_id, scope)
+                    )
+                    """
                 )
-                """
-            )
+
+    @staticmethod
+    async def _run_in_executor(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+        """Execute a blocking permission query/update outside the event loop."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, partial(func, *args, **kwargs))
     
     def check_permission(
         self, 
@@ -92,11 +105,13 @@ class PermissionManager:
         
         scope_str = scope.value if isinstance(scope, PermissionScope) else scope
         
-        cursor = self._conn.execute(
-            "SELECT status FROM permissions WHERE agent_id = ? AND scope = ?",
-            (agent_id, scope_str)
-        )
-        row = cursor.fetchone()
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT status FROM permissions WHERE agent_id = ? AND scope = ?",
+                (agent_id, scope_str)
+            )
+            row = cursor.fetchone()
+
         
         if row:
             try:
@@ -106,6 +121,15 @@ class PermissionManager:
                 return default
         
         return default
+
+    async def check_permission_async(
+        self,
+        agent_id: str,
+        scope: PermissionScope | str,
+        default: PermissionStatus = PermissionStatus.ASK
+    ) -> PermissionStatus:
+        """Async wrapper for :meth:`check_permission`."""
+        return await self._run_in_executor(self.check_permission, agent_id, scope, default)
     
     def set_permission(
         self,
@@ -128,25 +152,35 @@ class PermissionManager:
         scope_str = scope.value if isinstance(scope, PermissionScope) else scope
         status_str = status.value
         
-        with self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO permissions(agent_id, scope, status, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(agent_id, scope) DO UPDATE SET
-                    status = ?,
-                    updated_at = ?
-                """,
-                (
-                    agent_id,
-                    scope_str,
-                    status_str,
-                    datetime.now(UTC).isoformat(),
-                    status_str,
-                    datetime.now(UTC).isoformat(),
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO permissions(agent_id, scope, status, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(agent_id, scope) DO UPDATE SET
+                        status = ?,
+                        updated_at = ?
+                    """,
+                    (
+                        agent_id,
+                        scope_str,
+                        status_str,
+                        datetime.now(UTC).isoformat(),
+                        status_str,
+                        datetime.now(UTC).isoformat(),
+                    )
                 )
-            )
         LOGGER.info("Permission updated: %s.%s = %s", agent_id, scope_str, status_str)
+
+    async def set_permission_async(
+        self,
+        agent_id: str,
+        scope: PermissionScope | str,
+        status: PermissionStatus
+    ) -> None:
+        """Async wrapper for :meth:`set_permission`."""
+        await self._run_in_executor(self.set_permission, agent_id, scope, status)
     
     def get_all_permissions(self, agent_id: Optional[str] = None) -> Dict[str, Dict[str, str]]:
         """Get all permissions, optionally filtered by agent_id.
@@ -160,31 +194,36 @@ class PermissionManager:
         if not self._conn:
             return {}
         
-        if agent_id:
-            cursor = self._conn.execute(
-                "SELECT scope, status FROM permissions WHERE agent_id = ?",
-                (agent_id,)
-            )
-        else:
-            cursor = self._conn.execute(
-                "SELECT agent_id, scope, status FROM permissions"
-            )
-        
-        result: Dict[str, Dict[str, str]] = {}
-        for row in cursor.fetchall():
+        with self._lock:
             if agent_id:
-                # Single agent query
-                if agent_id not in result:
-                    result[agent_id] = {}
-                result[agent_id][row["scope"]] = row["status"]
+                cursor = self._conn.execute(
+                    "SELECT scope, status FROM permissions WHERE agent_id = ?",
+                    (agent_id,)
+                )
             else:
-                # All agents query
-                aid = row["agent_id"]
-                if aid not in result:
-                    result[aid] = {}
-                result[aid][row["scope"]] = row["status"]
+                cursor = self._conn.execute(
+                    "SELECT agent_id, scope, status FROM permissions"
+                )
+            
+            result: Dict[str, Dict[str, str]] = {}
+            for row in cursor.fetchall():
+                if agent_id:
+                    # Single agent query
+                    if agent_id not in result:
+                        result[agent_id] = {}
+                    result[agent_id][row["scope"]] = row["status"]
+                else:
+                    # All agents query
+                    aid = row["agent_id"]
+                    if aid not in result:
+                        result[aid] = {}
+                    result[aid][row["scope"]] = row["status"]
         
         return result
+
+    async def get_all_permissions_async(self, agent_id: Optional[str] = None) -> Dict[str, Dict[str, str]]:
+        """Async wrapper for :meth:`get_all_permissions`."""
+        return await self._run_in_executor(self.get_all_permissions, agent_id)
     
     def revoke_permission(self, agent_id: str, scope: PermissionScope | str) -> None:
         """Revoke (delete) a permission, causing it to default to ASK.
@@ -198,16 +237,34 @@ class PermissionManager:
         
         scope_str = scope.value if isinstance(scope, PermissionScope) else scope
         
-        with self._conn:
-            self._conn.execute(
-                "DELETE FROM permissions WHERE agent_id = ? AND scope = ?",
-                (agent_id, scope_str)
-            )
+        with self._lock:
+            with self._conn:
+                self._conn.execute(
+                    "DELETE FROM permissions WHERE agent_id = ? AND scope = ?",
+                    (agent_id, scope_str)
+                )
         LOGGER.info("Permission revoked: %s.%s", agent_id, scope_str)
+
+    async def revoke_permission_async(self, agent_id: str, scope: PermissionScope | str) -> None:
+        """Async wrapper for :meth:`revoke_permission`."""
+        await self._run_in_executor(self.revoke_permission, agent_id, scope)
     
     def close(self) -> None:
         """Close database connection."""
         if self._conn:
-            self._conn.close()
-            self._conn = None
+            with self._lock:
+                self._conn.close()
+                self._conn = None
+
+    def __enter__(self) -> "PermissionManager":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:  # pragma: no cover - defensive cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
 

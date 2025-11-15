@@ -1,5 +1,6 @@
 """Unit tests for memory_manager module."""
 
+import asyncio
 import json
 import tempfile
 from pathlib import Path
@@ -100,5 +101,21 @@ class TestMemoryManager(TestCase):
         self.memory.save_fact("Test fact", {"metadata": "value"})
         relevant = self.memory.recall_relevant({"application": "test"}, limit=1)
         assert len(relevant) > 0
+
+    def test_async_helpers(self):
+        """Ensure async wrappers execute without blocking."""
+        asyncio.run(self.memory.save_fact_async("Async fact", {"meta": "value"}))
+        relevant = asyncio.run(
+            self.memory.recall_relevant_async({}, limit=1)
+        )
+        assert len(relevant) > 0
+
+    def test_async_preferences(self):
+        """Async preference helpers should persist values."""
+        asyncio.run(self.memory.set_pref_async("clipboard_consent", "allow"))
+        pref = asyncio.run(self.memory.get_pref_async("clipboard_consent", "ask"))
+        assert pref == "allow"
+        prefs = asyncio.run(self.memory.get_all_prefs_async())
+        assert "clipboard_consent" in prefs
 
 

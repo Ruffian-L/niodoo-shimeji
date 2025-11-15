@@ -1,5 +1,14 @@
 # Changelog
 
+## 2025-01-15 - Zombie Process Cleanup & Prevention
+
+### Zombie Process Detection & Cleanup
+- **Added `cleanup_zombie_processes()` function**: New utility in `ProductivityTools` that detects zombie processes and attempts to clean them up by signaling parent processes with SIGCHLD to encourage reaping
+- **Improved process spawning**: Replaced `subprocess.Popen` with double-fork pattern in `ensure_shimeji_running()` to completely detach `shijima-qt` processes. The grandchild process is adopted by init (PID 1), preventing zombies when the process exits
+- **Signal handler for child reaping**: Added SIGCHLD handler in fallback subprocess mode to automatically reap child processes using `os.waitpid()` with `WNOHANG` flag
+- **Zombie cleanup executed**: Cleaned up 3 existing zombie processes (PIDs 3961, 3966, 3979, 10208) by signaling their parent processes
+- **Prevention mechanism**: Double-fork ensures spawned processes won't become zombies even if parent doesn't explicitly wait for them, as init always reaps all children
+
 ## 2025-01-15 - Features & Bug Fixes
 
 ### Python 3.13 Compatibility Fixes

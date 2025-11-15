@@ -108,3 +108,4 @@ class StructuredLogger:
         
         self.logger.info(json.dumps(event, ensure_ascii=False))
 
+

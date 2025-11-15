@@ -54,3 +54,4 @@ class MockGenerativeModel:
         # Default mock response
         return MockResponse(text="Mock response")
 
+

@@ -41,6 +41,7 @@ if command -v apt-get &> /dev/null; then
         python3 \
         python3-venv \
         python3-pip \
+        python3-systemd \
         xclip \
         wl-clipboard \
         gnome-screenshot \
@@ -59,6 +60,7 @@ elif command -v dnf &> /dev/null; then
         libarchive-devel \
         python3 \
         python3-pip \
+        python3-systemd \
         xclip \
         wl-clipboard \
         gnome-screenshot \
@@ -77,6 +79,7 @@ elif command -v pacman &> /dev/null; then
         libarchive \
         python \
         python-pip \
+        python-systemd \
         xclip \
         wl-clipboard \
         gnome-screenshot \
@@ -86,7 +89,7 @@ elif command -v pacman &> /dev/null; then
 else
     echo "Warning: Unsupported package manager. Please install dependencies manually:"
     echo "  - git, build-essential/cmake, Qt6 dev packages"
-    echo "  - python3, python3-venv, python3-pip"
+    echo "  - python3, python3-venv, python3-pip, python3-systemd"
     echo "  - xclip, wl-clipboard, gnome-screenshot, scrot"
     echo "  - pydbus"
 fi
@@ -172,7 +175,30 @@ pip install \
     PySide6 \
     pydbus \
     watchdog \
+    psutil \
     || echo "Warning: Some Python packages may have failed to install"
+
+# Install optional dependencies for enhanced monitoring
+echo "  Installing optional monitoring dependencies..."
+# Note: nvidia-ml-py is optional - GPU monitoring requires NVIDIA GPU
+pip install \
+    nvidia-ml-py \
+    || echo "  Note: nvidia-ml-py not available (GPU monitoring disabled - install manually if needed)"
+
+# Install comprehensive enhancement dependencies
+echo "  Installing comprehensive enhancement dependencies..."
+pip install \
+    vosk \
+    pyaudio \
+    pyttsx3 \
+    scikit-learn \
+    schedule \
+    numpy \
+    pandas \
+    sentence-transformers \
+    sqlcipher3 \
+    Pillow \
+    || echo "  Warning: Some enhancement packages may have failed to install"
 
 echo "  ✓ Python environment ready"
 echo ""

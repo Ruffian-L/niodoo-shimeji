@@ -44,3 +44,4 @@ class TestProductivityTools(TestCase):
         assert "shutdown" in DANGEROUS_COMMANDS
         assert len(DANGEROUS_COMMANDS) > 0
 
+

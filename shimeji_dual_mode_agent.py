@@ -14,11 +14,13 @@ import contextlib
 import errno
 import json
 import logging
+import multiprocessing
 import os
 import re
 import subprocess
 import time
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, auto
@@ -45,6 +47,7 @@ from modules.productivity_tools import ProductivityTools
 from modules.structured_logger import StructuredLogger
 from modules.decision_executor import DecisionExecutor
 from modules.event_bus import EventBus, EventType
+from modules.system_monitor import MonitoringManager, SystemAlert, AlertSeverity
 
 LOGGER = logging.getLogger(__name__)
 
@@ -345,6 +348,8 @@ class DualModeAgent:
         listen_port: int = DEFAULT_LISTEN_PORT,
     ) -> None:
         self.privacy_filter = PrivacyFilter()
+        # Initialize hybrid privacy filter (will be set after process pool is created)
+        self._hybrid_privacy_filter: Optional[Any] = None
         self.context_sniffer = ContextSniffer()
 
         action_paths_env = os.getenv("SHIMEJI_ACTIONS_PATHS")
@@ -387,6 +392,10 @@ class DualModeAgent:
         self.cli_brain = CLIBrain(pro_model, function_declarations, rate_limiter=rate_limiter)
         self.cli_brain._structured_logger = self._structured_logger
         
+        # Create permission manager
+        from modules.permission_manager import PermissionManager
+        self._permission_manager = PermissionManager()
+        
         # Create decision executor
         self._decision_executor = DecisionExecutor(self)
         
@@ -416,6 +425,7 @@ class DualModeAgent:
         self._recent_actions: Deque[str] = deque(maxlen=20)
         self.overlay = SpeechBubbleOverlay()
         self.overlay.set_prompt_sender(self._submit_cli_prompt)
+        self.overlay._agent_ref = self  # Store agent reference for event bus access (P2.4)
         self._greeting_shown = False  # Flag to prevent duplicate greetings
         try:
             self._anchor_poll_interval = max(0.1, float(os.getenv("SHIMEJI_ANCHOR_POLL", "0.5")))
@@ -424,6 +434,54 @@ class DualModeAgent:
         self._anchor_task: Optional[asyncio.Task[None]] = None
         self._cleanup_task: Optional[asyncio.Task[None]] = None
         self._config_watcher_task: Optional[asyncio.Task[None]] = None
+        self._critical_alert_cache: Dict[str, float] = {}  # Rate limiting for critical alert proactive decisions
+        self._vision_analysis_task: Optional[asyncio.Task[None]] = None
+        self._latest_vision_analysis: Optional[Dict[str, Any]] = None
+        
+        # Create ProcessPoolExecutor for CPU-bound tasks (whisper.cpp, local LLM, etc.)
+        # This must use 'spawn' method (set in main()) to avoid asyncio event loop conflicts on Linux
+        max_workers = int(os.getenv("PROCESS_POOL_WORKERS", "2"))
+        self._process_pool: Optional[ProcessPoolExecutor] = ProcessPoolExecutor(max_workers=max_workers)
+        
+        # Initialize hybrid privacy filter with process pool
+        try:
+            from modules.privacy_filter_hybrid import HybridPrivacyFilter
+            self._hybrid_privacy_filter = HybridPrivacyFilter(process_pool=self._process_pool)
+            if self._hybrid_privacy_filter.is_available():
+                LOGGER.info("Hybrid privacy filter initialized (local LLM: %s)", self._hybrid_privacy_filter._provider)
+            else:
+                LOGGER.info("Hybrid privacy filter not available (local LLM not found); using basic filter only")
+        except Exception as exc:
+            LOGGER.warning("Failed to initialize hybrid privacy filter: %s", exc)
+            self._hybrid_privacy_filter = None
+        
+        # Create monitoring manager
+        self._monitoring_manager = MonitoringManager(
+            memory_manager=self.memory,
+            event_bus=self._event_bus,
+            alert_handler=None,  # Use event bus instead of direct handler to avoid duplicates
+        )
+        
+        # Subscribe to system alerts via event bus
+        self._event_bus.subscribe(EventType.SYSTEM_ALERT, self._on_system_alert)
+        
+        # Subscribe to events for state machine transitions
+        self._event_bus.subscribe(EventType.DECISION_MADE, self._on_decision_made)
+        self._event_bus.subscribe(EventType.MESSAGE_SENT, self._on_message_sent)
+        
+        # Initialize D-Bus listener
+        from modules.dbus_integration import DBusListener
+        self._dbus_listener = DBusListener(event_bus=self._event_bus)
+        
+        # Initialize journal monitor (P2.5)
+        from modules.journal_monitor import JournalMonitor
+        self._journal_monitor = JournalMonitor(event_bus=self._event_bus)
+        
+        # Subscribe to D-Bus events
+        self._event_bus.subscribe(EventType.DBUS_NOTIFICATION, self._on_dbus_notification)
+        
+        # Subscribe to file drop events (P2.4)
+        self._event_bus.subscribe(EventType.FILE_DROPPED, self._on_file_dropped)
 
     # ------------------------------------------------------------------
     async def _cleanup_loop(self) -> None:
@@ -520,6 +578,21 @@ class DualModeAgent:
         self._anchor_task = asyncio.create_task(self._anchor_loop())
         self._proactive_task = asyncio.create_task(self._proactive_loop())
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+        
+        # Start vision analysis loop (P2.2)
+        vision_interval = int(os.getenv("VISION_ANALYSIS_INTERVAL", "45"))
+        if vision_interval > 0:
+            self._vision_analysis_task = asyncio.create_task(self._vision_analysis_loop(vision_interval))
+        
+        # Start system monitoring
+        await self._monitoring_manager.start()
+        
+        # Start D-Bus listener
+        await self._dbus_listener.start()
+        
+        # Start journal monitor (P2.5)
+        await self._journal_monitor.start()
+        
         LOGGER.info("DualModeAgent started in PROACTIVE mode")
 
     async def shutdown(self) -> None:
@@ -545,9 +618,33 @@ class DualModeAgent:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._config_watcher_task
             self._config_watcher_task = None
+        if self._vision_analysis_task:
+            self._vision_analysis_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._vision_analysis_task
+            self._vision_analysis_task = None
         await self._invocation_server.stop()
+        
+        # Stop system monitoring
+        await self._monitoring_manager.stop()
+        
+        # Stop D-Bus listener
+        if hasattr(self, '_dbus_listener'):
+            await self._dbus_listener.stop()
+        
+        # Stop journal monitor
+        if hasattr(self, '_journal_monitor'):
+            await self._journal_monitor.stop()
+        
+        # Shutdown process pool
+        if self._process_pool:
+            self._process_pool.shutdown(wait=True)
+            self._process_pool = None
+        
         if self._unsubscribe_callback:
             self._unsubscribe_callback()
+        if hasattr(self, '_permission_manager') and self._permission_manager:
+            self._permission_manager.close()
         self.memory.close()
         self.overlay.stop()
         LOGGER.info("DualModeAgent stopped")
@@ -622,6 +719,298 @@ class DualModeAgent:
             LOGGER.info("Configuration reloaded successfully")
         except Exception as exc:
             LOGGER.error("Failed to reload configuration: %s", exc)
+    
+    # ------------------------------------------------------------------
+    def _on_system_alert(self, alert: SystemAlert) -> None:
+        """Event bus handler for system alerts - routes based on severity."""
+        if alert.severity == AlertSeverity.CRITICAL:
+            # Trigger proactive decision for critical alerts
+            asyncio.create_task(self._handle_critical_alert(alert))
+        else:
+            # Show notification for warnings/info
+            self._show_alert_notification(alert)
+    
+    async def _handle_critical_alert(self, alert: SystemAlert) -> None:
+        """Handle critical alert by triggering proactive Gemini decision."""
+        # Rate limit critical alert proactive decisions (max once per 5 minutes per alert type)
+        cache_key = f"critical_alert:{alert.alert_type}"
+        now = time.monotonic()
+        last_critical = self._critical_alert_cache.get(cache_key, 0)
+        
+        rate_limit_seconds = 300  # 5 minutes
+        if now - last_critical < rate_limit_seconds:
+            LOGGER.debug("Critical alert proactive decision rate limited: %s", alert.alert_type)
+            # Still show notification even if rate limited
+            self._show_alert_notification(alert)
+            return
+        
+        self._critical_alert_cache[cache_key] = now
+        
+        try:
+            # Build context for proactive decision
+            context = self._latest_context.copy()
+            context["system_alert"] = {
+                "type": alert.alert_type,
+                "message": alert.message,
+                "details": alert.details,
+            }
+            
+            # Get current system state
+            working_summary = self.memory.recent_observations()
+            episodic_summary = self.memory.recall_relevant(context)
+            
+            # Make proactive decision with alert context
+            decision = await self.proactive_brain.decide(
+                context,
+                self._recent_actions,
+                working_summary,
+                episodic_summary,
+                self.emotions.snapshot(),
+            )
+            
+            # Execute the decision
+            await self._execute_decision(decision, context)
+            
+        except Exception as exc:
+            LOGGER.error("Failed to handle critical alert: %s", exc)
+            # Fallback to notification
+            self._show_alert_notification(alert)
+    
+    def _show_alert_notification(self, alert: SystemAlert) -> None:
+        """Show alert notification in speech bubble and chat."""
+        # Format message based on severity
+        if alert.severity == AlertSeverity.CRITICAL:
+            prefix = "🚨 CRITICAL: "
+            author = "System Alert"
+            # Transition to Alert state for critical alerts
+            self._transition_mascot_state("Alert")
+        elif alert.severity == AlertSeverity.WARNING:
+            prefix = "⚠️ WARNING: "
+            author = "System Monitor"
+        else:
+            prefix = "ℹ️ INFO: "
+            author = "System Monitor"
+        
+        message = f"{prefix}{alert.message}"
+        
+        # Show in speech bubble
+        self.overlay.show_chat_message(author, message)
+        
+        # Also show in chat panel for persistence
+        # (overlay.show_chat_message already handles this)
+    
+    def _on_decision_made(self, data: Any) -> None:
+        """Handle decision made event - transition to Pondering state."""
+        self._transition_mascot_state("Pondering")
+    
+    def _on_message_sent(self, data: Any) -> None:
+        """Handle message sent event - transition to Interacting state."""
+        self._transition_mascot_state("Interacting")
+    
+    def _on_dbus_notification(self, data: Any) -> None:
+        """Handle D-Bus notification event.
+        
+        Args:
+            data: Event data containing notification or media state information
+        """
+        if not isinstance(data, dict):
+            return
+        
+        event_type = data.get("type")
+        
+        if event_type == "media_playing":
+            # Media is playing - could affect emotion model
+            player = data.get("player", "unknown")
+            metadata = data.get("metadata", {})
+            LOGGER.debug("Media playing: %s - %s", player, metadata.get("xesam:title", "Unknown"))
+            # Could update emotion model based on music
+        elif event_type == "notification":
+            # Desktop notification received
+            app_name = data.get("app_name", "unknown")
+            summary = data.get("summary", "")
+            body = data.get("body", "")
+            LOGGER.debug("Notification from %s: %s - %s", app_name, summary, body)
+            # Could intercept notifications based on context (e.g., during Zoom calls)
+    
+    def _on_file_dropped(self, data: Any) -> None:
+        """Handle file drop event (P2.4).
+        
+        Args:
+            data: Event data containing file_path or text
+        """
+        if not isinstance(data, dict):
+            return
+        
+        file_path = data.get("file_path")
+        text = data.get("text")
+        source = data.get("source", "unknown")
+        
+        # Route to proactive agent if idle, or reactive agent if chat active
+        if self.mode == AgentMode.PROACTIVE:
+            # Trigger proactive analysis
+            asyncio.create_task(self._handle_proactive_file_drop(file_path, text))
+        else:
+            # In CLI mode, file is already handled by chat window
+            LOGGER.debug("File dropped in CLI mode; handled by chat window")
+    
+    async def _handle_proactive_file_drop(self, file_path: Optional[str], text: Optional[str]) -> None:
+        """Handle file drop in proactive mode.
+        
+        Args:
+            file_path: Path to dropped file (if file)
+            text: Dropped text (if text)
+        """
+        if file_path:
+            # Analyze file with proactive agent
+            prompt = (
+                f"The user just dropped this file on me: {file_path}\n"
+                "Analyze its content and suggest 3-5 relevant, actionable tool calls "
+                "(e.g., 'Summarize', 'Rename based on content', 'Move to /Documents/Reports')."
+            )
+            try:
+                decision = await self.proactive_brain.decide(
+                    self._latest_context,
+                    self._recent_actions,
+                    self.memory.recent_observations(),
+                    self.memory.recall_relevant(self._latest_context),
+                    self.emotions.snapshot(),
+                )
+                await self._execute_decision(decision, self._latest_context)
+            except Exception as exc:
+                LOGGER.error("Proactive file analysis failed: %s", exc)
+        elif text:
+            # Analyze text snippet
+            prompt = f"The user dropped this text: {text}\nWhat should I do with it?"
+            try:
+                decision = await self.proactive_brain.decide(
+                    self._latest_context,
+                    self._recent_actions,
+                    self.memory.recent_observations(),
+                    self.memory.recall_relevant(self._latest_context),
+                    self.emotions.snapshot(),
+                )
+                await self._execute_decision(decision, self._latest_context)
+            except Exception as exc:
+                LOGGER.error("Proactive text analysis failed: %s", exc)
+    
+    async def _vision_analysis_loop(self, interval: int) -> None:
+        """Proactive screen context analysis loop (P2.2).
+        
+        Args:
+            interval: Seconds between vision analyses
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(interval)
+                if not self._running:
+                    break
+                
+                # Check permission before screenshot
+                if hasattr(self, '_permission_manager') and self._permission_manager:
+                    from modules.permission_manager import PermissionScope, PermissionStatus
+                    agent_id = "ProactiveBrain"
+                    permission = self._permission_manager.check_permission(
+                        agent_id, PermissionScope.CONTEXT_VISION_READ_SCREEN
+                    )
+                    if permission == PermissionStatus.DENY:
+                        LOGGER.debug("Vision analysis denied by permission")
+                        continue
+                
+                # Take screenshot
+                from modules.productivity_tools import ProductivityTools
+                screenshot_path = ProductivityTools.take_screenshot()
+                if not screenshot_path:
+                    continue
+                
+                # Analyze with Gemini Vision
+                prompt = (
+                    "Analyze this desktop screenshot. Identify the active application, "
+                    "window title, and any key UI elements or text. Based on this, "
+                    "what is the user's most likely current task? Also detect any error "
+                    "messages, pop-up dialogs, or stack traces. If found, extract the "
+                    "full text of the error. Respond with JSON: "
+                    "{'app': '...', 'task': '...', 'file': '...', 'error_text': '...'}"
+                )
+                
+                analysis = await self._analyze_image_with_vision(str(screenshot_path), prompt)
+                if analysis:
+                    # Parse structured output
+                    try:
+                        import json
+                        # Extract JSON from response
+                        if "{" in analysis and "}" in analysis:
+                            json_start = analysis.find("{")
+                            json_end = analysis.rfind("}") + 1
+                            json_str = analysis[json_start:json_end]
+                            self._latest_vision_analysis = json.loads(json_str)
+                            self._latest_context["vision_analysis"] = self._latest_vision_analysis
+                            
+                            # Check for errors (P2.3)
+                            if self._latest_vision_analysis.get("error_text"):
+                                await self._handle_detected_error(self._latest_vision_analysis["error_text"])
+                    except Exception as exc:
+                        LOGGER.debug("Failed to parse vision analysis: %s", exc)
+                        # Store raw analysis
+                        self._latest_vision_analysis = {"raw": analysis}
+                        self._latest_context["vision_analysis"] = self._latest_vision_analysis
+                
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOGGER.error("Vision analysis loop error: %s", exc)
+                await asyncio.sleep(interval)  # Wait before retry
+    
+    async def _handle_detected_error(self, error_text: str) -> None:
+        """Handle autonomously detected error (P2.3).
+        
+        Args:
+            error_text: Extracted error text from vision analysis
+        """
+        # Trigger high-priority proactive decision
+        context = self._latest_context.copy()
+        context["detected_error"] = error_text
+        
+        working_summary = self.memory.recent_observations()
+        episodic_summary = self.memory.recall_relevant(context)
+        
+        # Specialized prompt for error resolution
+        error_prompt = (
+            f"The user just encountered this error on their screen: {error_text}\n\n"
+            "1. Explain this error in simple terms.\n"
+            "2. Provide 3 concrete, step-by-step solutions the user might try.\n"
+            "3. Suggest a bash command or code snippet as a tool-call if appropriate."
+        )
+        
+        try:
+            # Use CLI brain for error analysis (Gemini Pro)
+            response = await self.cli_brain.respond(error_prompt, self)
+            if response:
+                self.overlay.show_chat_message("Shimeji", f"🚨 Error Detected!\n\n{response}")
+                self.overlay.show_bubble_message("Shimeji", "I saw an error! Check chat for help.", duration=10)
+                # Transition to Alert state
+                self._transition_mascot_state("Alert")
+        except Exception as exc:
+            LOGGER.error("Error resolution failed: %s", exc)
+    
+    def _transition_mascot_state(self, state_name: str) -> None:
+        """Transition mascot state machine to a new state.
+        
+        Args:
+            state_name: Name of the state to transition to
+        """
+        if hasattr(self.overlay, '_state_machine') and self.overlay._state_machine:
+            try:
+                # Use Qt's invokeMethod to safely call from asyncio thread
+                from PySide6.QtCore import QMetaObject, Qt
+                if self.overlay._state_machine._qobject:
+                    QMetaObject.invokeMethod(
+                        self.overlay._state_machine._qobject,
+                        "transition_to",
+                        Qt.ConnectionType.QueuedConnection,
+                        state_name
+                    )
+            except Exception as exc:
+                LOGGER.debug("Failed to transition state: %s", exc)
 
     # ------------------------------------------------------------------
     async def _proactive_loop(self) -> None:
@@ -719,7 +1108,16 @@ class DualModeAgent:
 
     async def _execute_decision(self, decision: ProactiveDecision, context_snapshot: Dict[str, Any]) -> int:
         """Execute a decision using the decision executor."""
-        return await self._decision_executor.execute(decision, context_snapshot)
+        # Publish decision made event for state machine
+        self._event_bus.publish(EventType.DECISION_MADE, {"action": decision.action})
+        # Transition to ExecutingTask state
+        self._transition_mascot_state("ExecutingTask")
+        
+        result = await self._decision_executor.execute(decision, context_snapshot)
+        
+        # Return to Idle after execution
+        self._transition_mascot_state("Idle")
+        return result
 
     # ------------------------------------------------------------------
     async def handle_cli_request(self, prompt: str) -> str:
@@ -832,10 +1230,13 @@ class DualModeAgent:
         loop = asyncio.get_running_loop()
         vision_model = genai.GenerativeModel(DEFAULT_PRO_MODEL)
         
+        # Use process pool for blocking operations to avoid freezing UI
+        executor = self._process_pool if self._process_pool else None
+        
         try:
             # Try direct file path first (most efficient)
             response = await loop.run_in_executor(
-                None, 
+                executor, 
                 lambda: vision_model.generate_content([image_path, question])
             )
             return self._extract_text_from_response(response)
@@ -849,8 +1250,10 @@ class DualModeAgent:
         try:
             import PIL.Image
             img = PIL.Image.open(image_path)
+            # Use process pool for blocking operations
+            executor = self._process_pool if self._process_pool else None
             response = await loop.run_in_executor(
-                None,
+                executor,
                 lambda: model.generate_content([img, question])
             )
             return self._extract_text_from_response(response)
@@ -866,9 +1269,14 @@ class DualModeAgent:
         """Last resort: upload file to Gemini."""
         uploaded_file = None
         try:
-            uploaded_file = genai.upload_file(path=image_path)
+            # Use process pool for blocking file operations
+            executor = self._process_pool if self._process_pool else None
+            uploaded_file = await loop.run_in_executor(
+                executor,
+                lambda: genai.upload_file(path=image_path)
+            )
             response = await loop.run_in_executor(
-                None,
+                executor,
                 lambda: model.generate_content([uploaded_file, question])
             )
             return self._extract_text_from_response(response)
@@ -878,7 +1286,12 @@ class DualModeAgent:
         finally:
             if uploaded_file:
                 try:
-                    genai.delete_file(uploaded_file.name)
+                    executor = self._process_pool if self._process_pool else None
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        executor,
+                        lambda: genai.delete_file(uploaded_file.name)
+                    )
                 except Exception as cleanup_exc:
                     LOGGER.warning("Failed to cleanup uploaded file: %s", cleanup_exc)
 
@@ -1051,6 +1464,15 @@ class DualModeAgent:
 
 
 async def main() -> None:
+    # CRITICAL: Set multiprocessing start method to 'spawn' before any asyncio loop is created
+    # This prevents "event loop is already running" errors on Linux when using ProcessPoolExecutor
+    # with asyncio. Must be called before asyncio.run() or any event loop creation.
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # Already set, ignore
+        pass
+    
     logging.basicConfig(level=logging.INFO)
     load_env_file(os.path.join(os.path.dirname(__file__), "shimeji.env"))
 

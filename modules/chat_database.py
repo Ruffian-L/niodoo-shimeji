@@ -348,3 +348,4 @@ class ChatDatabase:
         # SQLite connections are closed automatically, but we can reset session
         self._current_session_id = None
 
+

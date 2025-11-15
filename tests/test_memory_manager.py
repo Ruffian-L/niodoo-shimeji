@@ -101,3 +101,4 @@ class TestMemoryManager(TestCase):
         relevant = self.memory.recall_relevant({"application": "test"}, limit=1)
         assert len(relevant) > 0
 
+

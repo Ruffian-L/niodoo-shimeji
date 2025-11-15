@@ -17,6 +17,17 @@ class EventType(Enum):
     ERROR_OCCURRED = "error_occurred"
     MODE_SWITCHED = "mode_switched"
     DECISION_MADE = "decision_made"
+    SYSTEM_ALERT = "system_alert"
+    GESTURE_DETECTED = "gesture_detected"
+    VOICE_COMMAND = "voice_command"
+    FILE_DROPPED = "file_dropped"
+    FEEDBACK_RECEIVED = "feedback_received"
+    PATTERN_DETECTED = "pattern_detected"
+    AUDIO_DETECTED = "audio_detected"
+    PERMISSION_REQUESTED = "permission_requested"
+    TASK_SCHEDULED = "task_scheduled"
+    AGENT_SPAWNED = "agent_spawned"
+    DBUS_NOTIFICATION = "dbus_notification"
 
 
 class EventBus:

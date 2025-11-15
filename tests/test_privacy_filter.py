@@ -52,3 +52,4 @@ class TestPrivacyFilter(TestCase):
         result = self.filter.sanitise(text)
         assert "[CARD]" in result
 
+

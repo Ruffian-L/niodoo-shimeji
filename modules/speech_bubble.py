@@ -48,6 +48,7 @@ class SpeechBubbleOverlay:
         self._prompt_sender: Optional[Callable[[str], None]] = None
         self._anchor_lock = threading.Lock()
         self._anchor: Optional[Tuple[float, float]] = None
+        self._state_machine: Optional[Any] = None  # MascotStateMachine instance
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -112,10 +113,13 @@ class SpeechBubbleOverlay:
             from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QPainter, QPalette, QKeyEvent
             from PySide6.QtWidgets import (
                 QApplication,
+                QCheckBox,
+                QComboBox,
                 QFrame,
                 QHBoxLayout,
                 QLabel,
                 QLineEdit,
+                QMenu,
                 QPushButton,
                 QTextEdit,
                 QVBoxLayout,
@@ -128,6 +132,16 @@ class SpeechBubbleOverlay:
         app = QApplication.instance() or QApplication([])
         self._started.set()
         overlay_ref = self
+        
+        # Initialize mascot state machine
+        try:
+            from modules.mascot_state_machine import MascotStateMachine
+            overlay_ref._state_machine = MascotStateMachine()
+            if overlay_ref._state_machine.is_available():
+                LOGGER.info("Mascot state machine initialized in Qt thread")
+        except Exception as exc:
+            LOGGER.warning("Failed to initialize state machine: %s", exc)
+            overlay_ref._state_machine = None
         
         # Create shared chat database instance
         chat_db = ChatDatabase()
@@ -235,6 +249,15 @@ class SpeechBubbleOverlay:
                 self._clipboard_button.clicked.connect(self._on_clipboard_clicked)
                 self._clipboard_button.setStyleSheet("QPushButton { background-color: #3a3a3a; color: white; font-size: 14pt; }")
                 self._clipboard_button.setFixedWidth(40)
+                
+                # Monitoring alerts menu button
+                self._alerts_menu_button = QPushButton("🔔", self)
+                self._alerts_menu_button.setToolTip("Configure monitoring alerts")
+                self._alerts_menu_button.setStyleSheet("QPushButton { background-color: #3a3a3a; color: white; font-size: 14pt; }")
+                self._alerts_menu_button.setFixedWidth(40)
+                self._alerts_menu = QMenu(self)
+                self._alerts_menu_button.setMenu(self._alerts_menu)
+                self._setup_alerts_menu()
 
                 controls = QHBoxLayout()
                 controls.addWidget(self._input)
@@ -248,6 +271,7 @@ class SpeechBubbleOverlay:
                 search_layout = QHBoxLayout()
                 search_layout.addWidget(self._search_box)
                 search_layout.addWidget(self._clipboard_button)
+                search_layout.addWidget(self._alerts_menu_button)
                 search_layout.addWidget(self._open_folder_button)
                 search_layout.addWidget(self._import_button)
                 search_layout.addWidget(self._export_button)
@@ -302,6 +326,48 @@ class SpeechBubbleOverlay:
                     except Exception as exc:  # pragma: no cover - callback errors
                         LOGGER.exception("Prompt sender raised: %s", exc)
             
+            def _setup_alerts_menu(self) -> None:
+                """Set up the monitoring alerts dropdown menu with checkboxes."""
+                try:
+                    from modules.memory_manager import MemoryManager
+                    self._memory_manager = MemoryManager()
+                except Exception as exc:
+                    LOGGER.error("Failed to initialize memory manager for alerts menu: %s", exc)
+                    return
+                
+                # Alert types with their preference keys and display names
+                alert_types = [
+                    ("ram", "RAM Alerts"),
+                    ("gpu", "GPU Alerts"),
+                    ("disk", "Disk Alerts"),
+                    ("zombie", "Zombie Process Alerts"),
+                    ("network", "Network Alerts"),
+                    ("log", "Log Alerts"),
+                ]
+                
+                self._alert_checkboxes = {}
+                
+                for alert_type, display_name in alert_types:
+                    # Get current state (default: enabled)
+                    enabled = self._memory_manager.get_pref(f"alert_enabled_{alert_type}", True)
+                    
+                    # Create checkbox action
+                    action = self._alerts_menu.addAction(display_name)
+                    action.setCheckable(True)
+                    action.setChecked(enabled)
+                    
+                    # Connect to toggle handler (capture both variables properly)
+                    def make_toggle_handler(atype: str, dname: str):
+                        def toggle_handler(checked: bool) -> None:
+                            self._memory_manager.set_pref(f"alert_enabled_{atype}", checked)
+                            status = "enabled" if checked else "disabled"
+                            self.append_message("System", f"{dname} {status}")
+                            LOGGER.info("Alert type %s %s", atype, status)
+                        return toggle_handler
+                    
+                    action.triggered.connect(make_toggle_handler(alert_type, display_name))
+                    self._alert_checkboxes[alert_type] = action
+            
             def _on_clipboard_clicked(self) -> None:
                 """Read clipboard and ask Gemini about it."""
                 try:
@@ -342,6 +408,20 @@ class SpeechBubbleOverlay:
                 """Analyze a dropped file with Gemini."""
                 from pathlib import Path
                 import mimetypes
+                
+                # Publish FILE_DROPPED event to event bus (P2.4)
+                try:
+                    # Try to get agent reference from overlay
+                    if hasattr(overlay_ref, '_agent_ref'):
+                        agent = overlay_ref._agent_ref
+                        if agent and hasattr(agent, '_event_bus'):
+                            from modules.event_bus import EventType
+                            agent._event_bus.publish(
+                                EventType.FILE_DROPPED,
+                                {"file_path": file_path, "source": "chat_window"}
+                            )
+                except Exception as exc:
+                    LOGGER.debug("Failed to publish FILE_DROPPED event: %s", exc)
                 
                 file_path_obj = Path(file_path)
                 if not file_path_obj.exists():
@@ -649,6 +729,8 @@ class SpeechBubbleOverlay:
                 self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
                 self.setWindowFlag(Qt.FramelessWindowHint, True)
                 self.setAttribute(Qt.WA_TranslucentBackground, True)
+                # Ensure widget background is transparent
+                self.setStyleSheet("QWidget { background-color: transparent; }")
                 
                 self._current_text = QTextEdit(self)
                 self._current_text.setReadOnly(True)
@@ -676,10 +758,49 @@ class SpeechBubbleOverlay:
 
                 self._fade_timer: Optional[QTimer] = None
                 self._current_opacity = 1.0
+                
+                # Enable drag-and-drop on mascot bubble (P2.4)
+                self.setAcceptDrops(True)
 
                 self._update_position()
                 self.hide()  # Start hidden, show when message arrives
                 LOGGER.info("Bubble box initialized")
+            
+            def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+                """Handle drag enter event for file/text drops on mascot."""
+                if event.mimeData().hasUrls() or event.mimeData().hasText():
+                    event.acceptProposedAction()
+                else:
+                    event.ignore()
+            
+            def dropEvent(self, event: QDropEvent) -> None:
+                """Handle drop event on mascot - publish to event bus."""
+                # Publish FILE_DROPPED event (P2.4)
+                try:
+                    if hasattr(overlay_ref, '_agent_ref'):
+                        agent = overlay_ref._agent_ref
+                        if agent and hasattr(agent, '_event_bus'):
+                            from modules.event_bus import EventType
+                            
+                            if event.mimeData().hasUrls():
+                                # File drop
+                                files = [url.toLocalFile() for url in event.mimeData().urls()]
+                                for file_path in files:
+                                    agent._event_bus.publish(
+                                        EventType.FILE_DROPPED,
+                                        {"file_path": file_path, "source": "mascot"}
+                                    )
+                            elif event.mimeData().hasText():
+                                # Text drop
+                                text = event.mimeData().text()
+                                agent._event_bus.publish(
+                                    EventType.FILE_DROPPED,
+                                    {"text": text, "source": "mascot"}
+                                )
+                except Exception as exc:
+                    LOGGER.debug("Failed to publish FILE_DROPPED event: %s", exc)
+                
+                event.acceptProposedAction()
 
             def cleanup(self) -> None:
                 """Clean up Qt timers."""
@@ -692,6 +813,11 @@ class SpeechBubbleOverlay:
 
             def add_message(self, author: str, text: str, duration: int = 6) -> None:
                 """Show a new message, replacing the previous one."""
+                # Don't show empty messages
+                if not text or not text.strip():
+                    self.hide()
+                    return
+                
                 escaped_text = html.escape(text)
                 display = f"<b style='color:#333'>{html.escape(author)}:</b><br>{escaped_text}"
                 self._current_text.setHtml(display)

@@ -755,9 +755,17 @@ class SpeechBubbleOverlay:
                 self.setMinimumHeight(80)
                 self.setMaximumHeight(400)
 
+                # Hide immediately before any timers start to prevent flash
+                self.hide()
+                self.setVisible(False)
+                
+                # Track if we have content to show
+                self._has_content = False
+
                 self._reposition_timer = QTimer(self)
                 self._reposition_timer.timeout.connect(self._update_position)
-                self._reposition_timer.start(100)
+                # Only start timer if we have content and anchor
+                # Timer will be started when message is added
 
                 self._fade_timer: Optional[QTimer] = None
                 self._current_opacity = 1.0
@@ -765,9 +773,7 @@ class SpeechBubbleOverlay:
                 # Enable drag-and-drop on mascot bubble (P2.4)
                 self.setAcceptDrops(True)
 
-                self._update_position()
-                self.hide()  # Start hidden, show when message arrives
-                LOGGER.info("Bubble box initialized")
+                LOGGER.info("Bubble box initialized (hidden)")
             
             def dragEnterEvent(self, event: QDragEnterEvent) -> None:
                 """Handle drag enter event for file/text drops on mascot."""
@@ -818,14 +824,24 @@ class SpeechBubbleOverlay:
                 """Show a new message, replacing the previous one."""
                 # Don't show empty messages
                 if not text or not text.strip():
+                    self._has_content = False
                     self.hide()
+                    if self._reposition_timer and self._reposition_timer.isActive():
+                        self._reposition_timer.stop()
                     return
                 
                 # Don't show if there's no anchor (Shimeji position)
                 anchor = current_anchor()
                 if not anchor:
                     LOGGER.debug("BubbleBox: No anchor available, not showing message")
+                    self._has_content = False
+                    self.hide()
+                    if self._reposition_timer and self._reposition_timer.isActive():
+                        self._reposition_timer.stop()
                     return
+                
+                # Set content flag before showing
+                self._has_content = True
                 
                 escaped_text = html.escape(text)
                 display = f"<b style='color:#333'>{html.escape(author)}:</b><br>{escaped_text}"
@@ -838,12 +854,18 @@ class SpeechBubbleOverlay:
                 new_height = min(400, max(80, int(doc_size.height()) + 50))
                 self.setFixedSize(new_width, new_height)
                 
+                # Position first, then show
+                self._update_position()
+                
                 # Show and reset opacity
                 self._current_opacity = 1.0
                 self.setWindowOpacity(self._current_opacity)
                 self.show()
                 self.raise_()
-                self._update_position()
+                
+                # Start reposition timer now that we have content
+                if not self._reposition_timer.isActive():
+                    self._reposition_timer.start(100)
                 
                 # Cancel any existing fade timer
                 if self._fade_timer:
@@ -863,11 +885,19 @@ class SpeechBubbleOverlay:
                 if self._current_opacity <= 0:
                     if self._fade_timer:
                         self._fade_timer.stop()
+                    self._has_content = False
                     self.hide()
+                    # Stop reposition timer when hidden
+                    if self._reposition_timer and self._reposition_timer.isActive():
+                        self._reposition_timer.stop()
                 else:
                     self.setWindowOpacity(self._current_opacity)
 
             def _update_position(self) -> None:
+                # Don't update position if we don't have content or aren't visible
+                if not self._has_content or not self.isVisible():
+                    return
+                    
                 screen = QApplication.primaryScreen()
                 if not screen:
                     return
@@ -880,6 +910,9 @@ class SpeechBubbleOverlay:
                     # If no anchor, hide the bubble instead of showing in middle of screen
                     if self.isVisible():
                         self.hide()
+                        self._has_content = False
+                        if self._reposition_timer and self._reposition_timer.isActive():
+                            self._reposition_timer.stop()
                     return
                 x = max(geometry.left() + 20, min(x, geometry.right() - self.width() - 20))
                 y = max(geometry.top() + 20, min(y, geometry.bottom() - self.height() - 20))

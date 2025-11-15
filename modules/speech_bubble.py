@@ -130,6 +130,8 @@ class SpeechBubbleOverlay:
             return
 
         app = QApplication.instance() or QApplication([])
+        # Process any pending events to ensure QApplication is fully initialized
+        QApplication.processEvents()
         self._started.set()
         overlay_ref = self
         
@@ -168,6 +170,9 @@ class SpeechBubbleOverlay:
                 
                 # Set explicit dark background to prevent white box flash
                 self.setStyleSheet("QWidget { background-color: #1a1a1a; }")
+                
+                # Set opacity to 0 initially to prevent any flash, will be set to 1.0 when shown
+                self.setWindowOpacity(0.0)
                 
                 # Size based on screen - 35% of screen width, wider and shorter
                 screen = QApplication.primaryScreen()
@@ -281,11 +286,27 @@ class SpeechBubbleOverlay:
                 layout.addLayout(search_layout)
                 layout.addLayout(controls)
 
+                # Hide initially to prevent white flash, then show after styles are applied
+                self.hide()
                 self.dock()
+                
+                # Use single-shot timer to show after Qt processes stylesheet
+                QTimer.singleShot(50, lambda: self._delayed_show())
+                LOGGER.info("Chat panel initialized (will show after style application)")
+            
+            def _delayed_show(self) -> None:
+                """Show window after styles are applied to prevent white flash."""
+                # Ensure stylesheet is applied
+                self.setStyleSheet("QWidget { background-color: #1a1a1a; }")
+                # Process events to apply stylesheet
+                QApplication.processEvents()
+                # Set opacity to full before showing
+                self.setWindowOpacity(1.0)
+                # Now show
                 self.show()
                 self.raise_()
                 self.activateWindow()
-                LOGGER.info("Chat panel initialized at %s", self.pos())
+                LOGGER.info("Chat panel shown at %s", self.pos())
 
             def dock(self) -> None:
                 """Position chat window in bottom-right corner of screen."""

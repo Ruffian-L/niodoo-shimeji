@@ -168,11 +168,22 @@ class SpeechBubbleOverlay:
                 # Make it movable - keep title bar
                 # self.setWindowFlag(Qt.FramelessWindowHint, True)
                 
+                # CRITICAL: Hide immediately before anything else to prevent white flash
+                # Move off-screen first, then hide
+                self.move(-10000, -10000)  # Move way off-screen
+                self.hide()
+                self.setVisible(False)
+                
                 # Set explicit dark background to prevent white box flash
                 self.setStyleSheet("QWidget { background-color: #1a1a1a; }")
                 
                 # Set opacity to 0 initially to prevent any flash, will be set to 1.0 when shown
                 self.setWindowOpacity(0.0)
+                
+                # Prevent window from being shown automatically
+                self.setAttribute(Qt.WA_ShowWithoutActivating, False)
+                # Ensure window doesn't appear in taskbar until shown
+                self.setAttribute(Qt.WA_X11DoNotAcceptFocus, True)
                 
                 # Size based on screen - 35% of screen width, wider and shorter
                 screen = QApplication.primaryScreen()
@@ -286,22 +297,33 @@ class SpeechBubbleOverlay:
                 layout.addLayout(search_layout)
                 layout.addLayout(controls)
 
-                # Hide initially to prevent white flash, then show after styles are applied
+                # Ensure hidden before docking
                 self.hide()
+                self.setVisible(False)
                 self.dock()
                 
-                # Use single-shot timer to show after Qt processes stylesheet
-                QTimer.singleShot(50, lambda: self._delayed_show())
+                # Use longer delay to ensure Qt has fully processed everything
+                # Process events multiple times to ensure stylesheet is applied
+                QApplication.processEvents()
+                QTimer.singleShot(200, lambda: self._delayed_show())
                 LOGGER.info("Chat panel initialized (will show after style application)")
             
             def _delayed_show(self) -> None:
                 """Show window after styles are applied to prevent white flash."""
+                # Double-check we're still hidden
+                if self.isVisible():
+                    LOGGER.warning("ChatWindow was already visible before delayed show!")
+                    return
+                
                 # Ensure stylesheet is applied
                 self.setStyleSheet("QWidget { background-color: #1a1a1a; }")
-                # Process events to apply stylesheet
+                # Process events multiple times to ensure stylesheet is applied
+                QApplication.processEvents()
                 QApplication.processEvents()
                 # Set opacity to full before showing
                 self.setWindowOpacity(1.0)
+                # Process events again after setting opacity
+                QApplication.processEvents()
                 # Now show
                 self.show()
                 self.raise_()
@@ -320,6 +342,11 @@ class SpeechBubbleOverlay:
                 self.move(x, y)
 
             def show_panel(self) -> None:
+                """Show the chat panel, ensuring styles are applied first."""
+                # Ensure stylesheet is applied before showing
+                self.setStyleSheet("QWidget { background-color: #1a1a1a; }")
+                QApplication.processEvents()
+                self.setWindowOpacity(1.0)
                 self.dock()
                 self.show()
                 self.raise_()

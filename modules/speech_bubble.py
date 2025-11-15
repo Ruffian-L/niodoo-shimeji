@@ -52,6 +52,7 @@ class SpeechBubbleOverlay:
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
+            LOGGER.warning("SpeechBubbleOverlay thread already running, not starting again")
             return
         self._thread = threading.Thread(target=self._run, name="SpeechBubbleOverlay", daemon=True)
         self._thread.start()
@@ -129,7 +130,14 @@ class SpeechBubbleOverlay:
             LOGGER.error("PySide6 is required for the speech bubble overlay: %s", exc)
             return
 
-        app = QApplication.instance() or QApplication([])
+        # Check if QApplication already exists to prevent multiple instances
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+            LOGGER.info("Created new QApplication instance")
+        else:
+            LOGGER.info("Using existing QApplication instance")
+        
         # Process any pending events to ensure QApplication is fully initialized
         QApplication.processEvents()
         self._started.set()
@@ -966,9 +974,22 @@ class SpeechBubbleOverlay:
                 y = max(geometry.top() + 20, min(y, geometry.bottom() - self.height() - 20))
                 self.move(x, y)
 
-        chat_window = ChatWindow(chat_db=chat_db)
-        self._chat_window = chat_window  # Store reference for external access
-        bubble_box = BubbleBox()
+        # Only create windows once - check if they already exist
+        if not hasattr(overlay_ref, '_chat_window') or overlay_ref._chat_window is None:
+            chat_window = ChatWindow(chat_db=chat_db)
+            self._chat_window = chat_window  # Store reference for external access
+            LOGGER.info("Created ChatWindow")
+        else:
+            chat_window = overlay_ref._chat_window
+            LOGGER.info("Reusing existing ChatWindow")
+        
+        if not hasattr(overlay_ref, '_bubble_box') or overlay_ref._bubble_box is None:
+            bubble_box = BubbleBox()
+            self._bubble_box = bubble_box  # Store reference
+            LOGGER.info("Created BubbleBox")
+        else:
+            bubble_box = overlay_ref._bubble_box
+            LOGGER.info("Reusing existing BubbleBox")
 
         def process_bubble_queue() -> None:
             while not overlay_ref._queue.empty():

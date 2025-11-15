@@ -9,7 +9,9 @@
 - **BubbleBox positioning fix**: Added anchor check in `add_message()` and `_update_position()` to prevent bubble from appearing in middle of screen when Shimeji anchor is unavailable
 - **Timer management fix**: Reposition timer now only starts when bubble has content and valid anchor, preventing random flashes. Widget is hidden immediately on initialization before any timers start
 - **Content state tracking**: Added `_has_content` flag to track bubble state, ensuring reposition timer only runs when bubble should be visible
-- **Root cause**: Widget containers weren't explicitly set to proper background colors, and reposition timer was running continuously even when widget should be hidden, causing solid white boxes to flash during initialization or when anchor position is missing
+- **ChatWindow delayed show**: ChatWindow now starts with opacity 0.0 and is hidden, then uses QTimer.singleShot to show after stylesheet is applied, preventing white flash during initialization
+- **QApplication initialization**: Process QApplication events before creating windows to ensure full initialization
+- **Root cause**: Widget containers weren't explicitly set to proper background colors, and reposition timer was running continuously even when widget should be hidden, causing solid white boxes to flash during initialization or when anchor position is missing. Also, windows were being shown before Qt processed stylesheets, causing white flash.
 
 ## 2025-01-15 - Proactive Companion Architecture Implementation - COMPLETE
 

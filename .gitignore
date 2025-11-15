@@ -1,0 +1,147 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+shimeji_venv/
+venv/
+ENV/
+env/
+.venv
+
+# Environment variables and secrets
+shimeji.env
+*.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build artifacts
+*.o
+*.d
+*.a
+*.so
+*.build
+*.cc
+*.hpp
+*.h
+*.cpp
+*.c
+*.dll
+*.exe
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.make
+build/
+_build/
+
+# Qt
+*.pro.user
+*.pro.user.*
+*.qmlc
+*.jsc
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+*.autosave
+
+# Shijima-Qt build artifacts (but keep source)
+Shijima-Qt/*.o
+Shijima-Qt/*.d
+Shijima-Qt/*.a
+Shijima-Qt/*.cc
+Shijima-Qt/*.hpp
+Shijima-Qt/*.h
+Shijima-Qt/*.cpp
+Shijima-Qt/*.c
+Shijima-Qt/shijima-qt
+Shijima-Qt/shijima-qt.a
+Shijima-Qt/Makefile
+Shijima-Qt/*.build
+Shijima-Qt/libshijima/build/
+Shijima-Qt/libshimejifinder/build/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+var/
+
+# Logs
+*.log
+logs/
+
+# Chat history (may contain sensitive data)
+chat_history.json
+
+# Audio files (user-specific)
+*.wav
+*.mp3
+*.ogg
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# OS files
+Thumbs.db
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# SSH keys (just in case)
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# Compiled binaries
+shim
+*.bin
+
+Shijima-Qt/

@@ -1,0 +1,1 @@
+import unittest\nfrom modules.speech_bubble import SpeechBubbleOverlay\nclass TestOverlay(unittest.TestCase):\n    def test_start_stop(self):\n        overlay = SpeechBubbleOverlay()\n        overlay.start()\n        overlay.stop()

@@ -1,0 +1,83 @@
+GEMINI DEEP RESEARCH PROMPT:
+============================
+
+Research Topic: "Autonomous AI-Controlled Desktop Companions Using Gemini API Function Calling"
+
+Research Question:
+How can Google Gemini API with function calling be used to create an autonomous, self-aware desktop companion character (Shimeji) that controls its own behavior, reacts to user context, and acts as an interactive NPC?
+
+Specific Areas to Research:
+
+1. TECHNICAL IMPLEMENTATION
+   - Gemini API function calling capabilities and limitations
+   - Best practices for autonomous agent loops with LLMs
+   - How to structure function declarations for character control (jump, sit, walk, climb, etc.)
+   - Rate limits and cost optimization for continuous autonomous operation
+   - Context window management for long-running agents
+
+2. DESKTOP INTEGRATION
+   - Methods for desktop companion software to expose control APIs (HTTP REST, WebSocket, gRPC)
+   - Shimeji/desktop pet architectures and existing implementations
+   - Window tracking and screen context awareness on Linux/Windows/macOS
+   - Speech bubble/overlay rendering techniques for character dialogue
+
+3. AI AGENT DESIGN
+   - Prompt engineering for autonomous character behavior
+   - Personality consistency in long-running agents
+   - Decision-making frameworks for when to act vs. observe
+   - Balancing proactive behavior vs. user annoyance
+   - Memory and context retention across sessions
+
+4. SIMILAR PROJECTS & PRIOR ART
+   - Existing AI-powered desktop assistants (Clippy, Cortana, etc.)
+   - Modern LLM-based desktop agents
+   - Shimeji implementations and their APIs
+   - Desktop pet projects using AI/ML
+   - Virtual pet AI research
+
+5. USER EXPERIENCE CONSIDERATIONS
+   - Optimal frequency of autonomous actions
+   - Natural character behavior patterns
+   - User interaction modes (click, voice, text)
+   - Privacy concerns with screen monitoring
+   - Resource usage and performance impact
+
+6. ADVANCED FEATURES
+   - Multi-character interactions (spawning friends, social behaviors)
+   - Learning from user preferences over time
+   - Integration with productivity tools and workflows
+   - Emotional state modeling and expression
+   - Voice synthesis for character speech
+
+7. IMPLEMENTATION CHALLENGES
+   - Handling API failures and network issues gracefully
+   - Preventing repetitive or annoying behaviors
+   - Ensuring character stays "in character" long-term
+   - Managing state between restarts
+   - Cross-platform compatibility
+
+8. MONETIZATION & DISTRIBUTION
+   - Freemium models for AI desktop companions
+   - API cost management at scale
+   - Distribution platforms (Steam, app stores, etc.)
+   - Customization and modding support
+
+Please provide:
+- Technical architecture recommendations
+- Code examples and API patterns
+- Comparison of different approaches
+- Potential pitfalls and how to avoid them
+- Links to relevant documentation, papers, and projects
+- Step-by-step implementation guide
+- Cost estimates for running such a system
+
+Focus on practical, implementable solutions using:
+- Google Gemini 1.5 Flash (free tier)
+- Shijima-Qt or similar desktop pet frameworks
+- Python for the agent logic
+- HTTP REST APIs for character control
+- Linux (Ubuntu/GNOME) as primary platform
+
+
+
+

@@ -2,6 +2,12 @@
 
 ## 2025-01-15 - Features & Bug Fixes
 
+### Python 3.13 Compatibility Fixes
+- **Fixed subprocess.TimeoutError**: Changed to `TimeoutError` (removed from subprocess module in Python 3.13)
+- **Fixed asyncio.suppress**: Changed to `contextlib.suppress` (removed from asyncio in Python 3.13)
+- **Fixed PIL lambda pickling**: Replaced lambda functions with proper functions in `_analyze_with_pil_fallback` and `_analyze_with_upload_fallback` for multiprocessing compatibility
+- **Updated modules**: Fixed `asyncio.suppress` usage in dbus_integration, journal_monitor, user_model_synthesis, workflow_pattern_recognizer
+
 ### Shimeji Window-Sitting Feature
 - **Shimeji now sits on top of application windows**: Added window-sitting feature where the Shimeji mascot positions itself on top of the active application window (like Chrome, Firefox, etc.)
 - **Active window detection**: Uses ActiveWindowObserver to detect the currently active window

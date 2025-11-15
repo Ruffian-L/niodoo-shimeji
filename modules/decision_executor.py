@@ -321,39 +321,6 @@ class DecisionExecutor:
             self.agent.overlay.show_chat_message("Shimeji", f"Command: `{command}`\n\nOutput:\n```\n{output[:1000]}\n```")
         return self.agent._reaction_interval
     
-    async def _handle_take_screenshot(self, args: Dict[str, Any], context: Dict[str, Any]) -> int:
-        """Handle take_screenshot action."""
-        screenshot_path = ProductivityTools.take_screenshot()
-        if screenshot_path:
-            self.agent.overlay.show_bubble_message("Shimeji", f"Screenshot saved! Let me analyze it...", duration=5)
-            LOGGER.info("Screenshot captured: %s", screenshot_path)
-        else:
-            self.agent.overlay.show_bubble_message("Shimeji", "Couldn't take screenshot!", duration=3)
-        return self.agent._reaction_interval
-    
-    async def _handle_analyze_screenshot(self, args: Dict[str, Any], context: Dict[str, Any]) -> int:
-        """Handle analyze_screenshot action."""
-        screenshot_path = ProductivityTools.take_screenshot()
-        if not screenshot_path:
-            self.agent.overlay.show_bubble_message("Shimeji", "Couldn't take screenshot!", duration=3)
-            return self.agent._reaction_interval
-        
-        question = args.get("question", "What do you see in this screenshot? Describe what's on screen.")
-        self.agent.overlay.show_chat_message("Shimeji", "Analyzing screenshot... ⏳")
-        self.agent.overlay.show_bubble_message("Shimeji", "Analyzing screenshot... ⏳", duration=3)
-        
-        try:
-            analysis = await self.agent._analyze_image_with_vision(str(screenshot_path), question)
-            if analysis:
-                self.agent.overlay.show_chat_message("Shimeji", f"Screenshot Analysis:\n{analysis}")
-            else:
-                self.agent.overlay.show_chat_message("Shimeji", "Couldn't analyze screenshot.")
-        except Exception as exc:
-            LOGGER.error("Vision analysis failed: %s", exc)
-            self.agent.overlay.show_chat_message("Shimeji", "Analysis failed. Please try again.")
-            self.agent.overlay.show_bubble_message("Shimeji", "Analysis failed!", duration=5)
-        return self.agent._reaction_interval
-    
     async def _handle_check_system_status(self, args: Dict[str, Any], context: Dict[str, Any]) -> int:
         """Handle check_system_status action."""
         battery = ProductivityTools.get_battery_status()

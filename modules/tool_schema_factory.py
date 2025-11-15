@@ -176,23 +176,16 @@ def build_proactive_function_declarations(
                 },
             },
         },
-        {
-            "name": "read_clipboard",
-            "description": "Read the current clipboard content to see what the user copied.",
-            "parameters": {
-                "type": "OBJECT",
-                "properties": {},
-            },
-        },
+        # read_clipboard removed from proactive tools - users must manually request it via chat button
         {
             "name": "execute_bash",
-            "description": "Execute a bash command and return the output. Use for system tasks.",
+            "description": "Execute a bash command and return the output. IMPORTANT: This ACTUALLY RUNS the command - use it to delete files, edit configs, run scripts, etc. You can chain multiple calls: first find/locate files, then execute operations on them. Always execute the command when the user confirms - don't just describe what you would do.",
             "parameters": {
                 "type": "OBJECT",
                 "properties": {
                     "command": {
                         "type": "STRING",
-                        "description": "The bash command to execute.",
+                        "description": "The bash command to execute. Examples: 'rm ~/Desktop/prime_counter.py' to delete a file, 'ls ~/Desktop' to list files, 'cat ~/.ssh/config' to read a file, etc. This command WILL BE EXECUTED.",
                     }
                 },
                 "required": ["command"],

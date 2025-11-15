@@ -63,6 +63,8 @@ class DecisionExecutor:
     
     async def _handle_set_behavior(self, args: Dict[str, Any], context: Dict[str, Any]) -> int:
         """Handle set_behavior action."""
+        import random
+        
         behaviour = args.get("behavior_name") or "Idle"
         mascot_id = self.agent.desktop_controller.ensure_mascot()
         if mascot_id is None:
@@ -72,10 +74,96 @@ class DecisionExecutor:
         if self.agent.desktop_controller.set_behavior(behaviour, mascot_id=mascot_id):
             self.agent.emotions.on_behavior(behaviour)
             LOGGER.info("Proactive behavior triggered: %s", behaviour)
+            
+            # Add fun context-aware messages based on behavior (but not too spammy - only 30% chance)
+            if random.random() < 0.3:  # Only 30% chance to avoid spam
+                behavior_messages = self._get_behavior_messages(behaviour)
+                if behavior_messages:
+                    message = random.choice(behavior_messages)
+                    # Show in bubble only (not chat to reduce spam)
+                    self.agent.overlay.show_bubble_message("Shimeji", message, duration=4)
+            
             # Publish behavior change event
             from modules.event_bus import EventType
             self.agent._event_bus.publish(EventType.BEHAVIOR_CHANGED, {"behavior": behaviour, "mascot_id": mascot_id})
         return self.agent._proactive_interval
+    
+    def _get_behavior_messages(self, behavior: str) -> List[str]:
+        """Get fun context-aware messages for different behaviors."""
+        behavior_lower = behavior.lower()
+        
+        # Climbing behaviors
+        if "climb" in behavior_lower or "wall" in behavior_lower or "ceiling" in behavior_lower:
+            return [
+                "Spider-Shimeji mode activated! 🕷️",
+                "Look at me go! Nothing can stop me!",
+                "Climbing like a pro! Bet you can't do this!",
+                "Defying gravity over here!",
+                "This is my domain now!",
+                "Heights? No problem for me!",
+                "Watch me scale this like it's nothing!",
+            ]
+        
+        # Running/Walking behaviors
+        if "run" in behavior_lower or "walk" in behavior_lower or "dash" in behavior_lower:
+            return [
+                "Gotta go fast! ⚡",
+                "Zoom zoom! Can't catch me!",
+                "On the move! Don't blink or you'll miss me!",
+                "Speed mode: ACTIVATED!",
+                "Running circles around you!",
+                "I'm unstoppable when I'm moving!",
+            ]
+        
+        # Sitting/Idle behaviors
+        if "sit" in behavior_lower or "idle" in behavior_lower or "rest" in behavior_lower:
+            return [
+                "Taking a quick break... but I'm still watching! 👀",
+                "Just chilling here, no big deal.",
+                "Resting my legs, but my mind is sharp!",
+                "Pausing to observe... interesting things happening.",
+                "Taking a moment to strategize!",
+            ]
+        
+        # Jumping behaviors
+        if "jump" in behavior_lower or "hop" in behavior_lower:
+            return [
+                "BOING! 🦘",
+                "Jumping high! Watch this!",
+                "Air time! I'm flying!",
+                "Gravity? What's that?",
+                "Up, up, and away!",
+            ]
+        
+        # Falling behaviors
+        if "fall" in behavior_lower or "drop" in behavior_lower:
+            return [
+                "Whoa! That was unexpected!",
+                "Oops! My bad!",
+                "Recalculating trajectory...",
+                "Still got it!",
+            ]
+        
+        # Spinning behaviors
+        if "spin" in behavior_lower:
+            return [
+                "Dizzy mode: ON! 🌀",
+                "Spinning like a top!",
+                "Can't stop, won't stop!",
+                "Round and round we go!",
+            ]
+        
+        # Chasing behaviors
+        if "chase" in behavior_lower or "mouse" in behavior_lower:
+            return [
+                "I see something interesting! 👀",
+                "On the hunt!",
+                "Tracking movement...",
+                "Something caught my attention!",
+            ]
+        
+        # Default for unknown behaviors
+        return []
     
     async def _handle_observe_and_wait(self, args: Dict[str, Any], context: Dict[str, Any]) -> int:
         """Handle observe_and_wait action."""
@@ -90,7 +178,9 @@ class DecisionExecutor:
         """Handle show_dialogue action."""
         text = args.get("text", "...")
         duration = int(args.get("duration_seconds", 6))
+        # Only show in bubble, NOT in chat to reduce spam
         self.agent.overlay.show_bubble_message("Shimeji", text, duration=duration)
+        # Don't add to chat panel - too spammy
         self.agent.emotions.on_dialogue()
         return self.agent._reaction_interval
     

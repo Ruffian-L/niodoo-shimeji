@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from modules.chat_database import ChatDatabase
+
 import html
 import json
 import logging
@@ -106,8 +108,8 @@ class SpeechBubbleOverlay:
     # ------------------------------------------------------------------
     def _run(self) -> None:  # pragma: no cover - requires GUI environment
         try:
-            from PySide6.QtCore import Qt, QTimer, Signal
-            from PySide6.QtGui import QColor, QPainter, QPalette
+            from PySide6.QtCore import Qt, QTimer, Signal, QUrl
+            from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QPainter, QPalette, QKeyEvent
             from PySide6.QtWidgets import (
                 QApplication,
                 QFrame,
@@ -119,7 +121,6 @@ class SpeechBubbleOverlay:
                 QVBoxLayout,
                 QWidget,
             )
-            from PySide6.QtGui import QKeyEvent
         except ImportError as exc:  # pragma: no cover - import guard
             LOGGER.error("PySide6 is required for the speech bubble overlay: %s", exc)
             return
@@ -127,6 +128,9 @@ class SpeechBubbleOverlay:
         app = QApplication.instance() or QApplication([])
         self._started.set()
         overlay_ref = self
+        
+        # Create shared chat database instance
+        chat_db = ChatDatabase()
 
         def current_anchor() -> Optional[Tuple[int, int]]:
             anchor = overlay_ref._get_anchor()
@@ -140,14 +144,31 @@ class SpeechBubbleOverlay:
         class ChatWindow(QWidget):
             user_submitted = Signal(str)
 
-            def __init__(self) -> None:
+            def __init__(self, chat_db: Optional[ChatDatabase] = None) -> None:
                 super().__init__()
                 self.setWindowTitle("Shimeji Chat Log")
                 self.setWindowFlag(Qt.Window, True)
                 self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
                 # Make it movable - keep title bar
                 # self.setWindowFlag(Qt.FramelessWindowHint, True)
-                self.resize(320, 640)
+                
+                # Size based on screen - 35% of screen width, wider and shorter
+                screen = QApplication.primaryScreen()
+                if screen:
+                    screen_geometry = screen.availableGeometry()
+                    # 35% of screen width, height is 40% of width (wider and shorter)
+                    width = int(screen_geometry.width() * 0.35)
+                    height = int(width * 0.4)  # Make it wider (width is 2.5x height)
+                    # Minimum and maximum constraints
+                    width = max(500, min(width, 1000))  # Between 500-1000px wide
+                    height = max(300, min(height, 600))  # Between 300-600px tall
+                    self.resize(width, height)
+                else:
+                    # Fallback if screen detection fails
+                    self.resize(700, 280)  # Wide and short default
+                
+                # Enable drag-and-drop for file analysis
+                self.setAcceptDrops(True)
 
                 self._history = QTextEdit(self)
                 self._history.setReadOnly(True)
@@ -155,13 +176,16 @@ class SpeechBubbleOverlay:
                     "QTextEdit { background-color: #1a1a1a; color: #00ff00; font-size: 11pt; border: 2px solid #00ff00; }"
                 )
 
-                self._chat_history: List[Dict[str, str]] = self._load_history()
+                # Initialize chat database
+                self._chat_db = chat_db or ChatDatabase()
+                # Create a new session for this run
+                self._session_id = self._chat_db.create_new_session()
+                LOGGER.info("Created new chat session %d", self._session_id)
+                
+                # Load messages from current session
+                self._chat_history: List[Dict[str, str]] = self._chat_db.get_messages(self._session_id)
                 for msg in self._chat_history:
                     self.append_message(msg["author"], msg["text"], persist=False)
-
-                self._save_timer = QTimer(self)
-                self._save_timer.setSingleShot(True)
-                self._save_timer.timeout.connect(self._do_save)
 
                 self._input = QLineEdit(self)
                 self._input.setPlaceholderText("Type a message...")
@@ -192,6 +216,25 @@ class SpeechBubbleOverlay:
                 self._export_button = QPushButton("Export", self)
                 self._export_button.clicked.connect(self.export_to_markdown)
                 self._export_button.setStyleSheet("QPushButton { background-color: #3a3a3a; color: white; }")
+                
+                # Import button
+                self._import_button = QPushButton("Import", self)
+                self._import_button.clicked.connect(self.import_from_file)
+                self._import_button.setStyleSheet("QPushButton { background-color: #3a3a3a; color: white; }")
+                
+                # Open folder button (opens exports directory)
+                self._open_folder_button = QPushButton("📁", self)
+                self._open_folder_button.setToolTip("Open exports folder")
+                self._open_folder_button.clicked.connect(self.open_exports_folder)
+                self._open_folder_button.setStyleSheet("QPushButton { background-color: #3a3a3a; color: white; font-size: 14pt; }")
+                self._open_folder_button.setFixedWidth(40)
+                
+                # Clipboard button - ask Gemini about clipboard
+                self._clipboard_button = QPushButton("📋", self)
+                self._clipboard_button.setToolTip("Ask Gemini about your clipboard")
+                self._clipboard_button.clicked.connect(self._on_clipboard_clicked)
+                self._clipboard_button.setStyleSheet("QPushButton { background-color: #3a3a3a; color: white; font-size: 14pt; }")
+                self._clipboard_button.setFixedWidth(40)
 
                 controls = QHBoxLayout()
                 controls.addWidget(self._input)
@@ -204,6 +247,9 @@ class SpeechBubbleOverlay:
                 layout.addWidget(self._typing_indicator)
                 search_layout = QHBoxLayout()
                 search_layout.addWidget(self._search_box)
+                search_layout.addWidget(self._clipboard_button)
+                search_layout.addWidget(self._open_folder_button)
+                search_layout.addWidget(self._import_button)
                 search_layout.addWidget(self._export_button)
                 layout.addLayout(search_layout)
                 layout.addLayout(controls)
@@ -215,10 +261,12 @@ class SpeechBubbleOverlay:
                 LOGGER.info("Chat panel initialized at %s", self.pos())
 
             def dock(self) -> None:
+                """Position chat window in bottom-right corner of screen."""
                 screen = QApplication.primaryScreen()
                 if not screen:
                     return
                 geometry = screen.availableGeometry()
+                # Position in bottom-right with some margin
                 x = geometry.right() - self.width() - 20
                 y = geometry.bottom() - self.height() - 20
                 self.move(x, y)
@@ -237,21 +285,10 @@ class SpeechBubbleOverlay:
                 bar = self._history.verticalScrollBar()
                 bar.setValue(bar.maximum())
                 if persist:
+                    # Save to database
+                    self._chat_db.add_message(author, text, self._session_id)
+                    # Also update local cache for filtering
                     self._chat_history.append({"author": author, "text": text})
-                    self._save_history()
-
-            def _save_history(self) -> None:
-                """Debounced save to avoid excessive I/O."""
-                self._save_timer.stop()
-                self._save_timer.start(2000)  # Save after 2s idle
-
-            def _do_save(self) -> None:
-                """Actually save the history."""
-                try:
-                    with open("chat_history.json", "w", encoding="utf-8") as handle:
-                        json.dump(self._chat_history, handle)
-                except Exception as exc:
-                    LOGGER.warning("Failed to persist chat history: %s", exc)
 
             def _on_submit(self) -> None:
                 text = self._input.text().strip()
@@ -264,13 +301,164 @@ class SpeechBubbleOverlay:
                         overlay_ref._prompt_sender(text)
                     except Exception as exc:  # pragma: no cover - callback errors
                         LOGGER.exception("Prompt sender raised: %s", exc)
-
-            def _load_history(self) -> List[Dict[str, str]]:
+            
+            def _on_clipboard_clicked(self) -> None:
+                """Read clipboard and ask Gemini about it."""
                 try:
-                    with open("chat_history.json", "r", encoding="utf-8") as handle:
-                        return json.load(handle)
-                except (FileNotFoundError, json.JSONDecodeError):
-                    return []
+                    from modules.productivity_tools import ProductivityTools
+                    clipboard_content = ProductivityTools.read_clipboard()
+                    if clipboard_content:
+                        # Show what was copied
+                        preview = clipboard_content[:200] + "..." if len(clipboard_content) > 200 else clipboard_content
+                        self.append_message("You", f"[Clipboard] {preview}")
+                        # Ask Gemini about it
+                        prompt = f"Here's what I copied to my clipboard:\n\n{clipboard_content[:5000]}\n\nCan you help me with this?"
+                        if overlay_ref._prompt_sender:
+                            try:
+                                overlay_ref._prompt_sender(prompt)
+                            except Exception as exc:
+                                LOGGER.exception("Prompt sender raised: %s", exc)
+                    else:
+                        self.append_message("System", "Clipboard is empty!")
+                except Exception as exc:
+                    LOGGER.exception("Failed to read clipboard: %s", exc)
+                    self.append_message("System", f"Failed to read clipboard: {exc}")
+            
+            def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+                """Handle drag enter event for file drops."""
+                if event.mimeData().hasUrls():
+                    event.acceptProposedAction()
+                else:
+                    event.ignore()
+            
+            def dropEvent(self, event: QDropEvent) -> None:
+                """Handle file drop event."""
+                files = [url.toLocalFile() for url in event.mimeData().urls()]
+                for file_path in files:
+                    self._handle_dropped_file(file_path)
+                event.acceptProposedAction()
+            
+            def _handle_dropped_file(self, file_path: str) -> None:
+                """Analyze a dropped file with Gemini."""
+                from pathlib import Path
+                import mimetypes
+                
+                file_path_obj = Path(file_path)
+                if not file_path_obj.exists():
+                    self.append_message("System", f"File not found: {file_path}")
+                    return
+                
+                file_name = file_path_obj.name
+                file_ext = file_path_obj.suffix.lower()
+                mime_type, _ = mimetypes.guess_type(str(file_path))
+                
+                # Show that we're processing the file
+                self.append_message("You", f"📎 Dropped: {file_name}")
+                
+                # Determine file type and handle accordingly
+                if mime_type and mime_type.startswith('image/'):
+                    # Image file - use vision API
+                    self._analyze_image_file(file_path)
+                elif file_ext == '.pdf':
+                    # PDF file - extract text
+                    self._analyze_pdf_file(file_path)
+                elif file_ext in ['.md', '.txt', '.py', '.js', '.ts', '.html', '.css', '.json', '.yaml', '.yml', '.xml', '.csv', '.sh', '.bash', '.zsh']:
+                    # Text-based file - read and analyze
+                    self._analyze_text_file(file_path)
+                else:
+                    # Unknown file type - try to read as text
+                    self.append_message("System", f"Unknown file type: {file_ext}. Trying to read as text...")
+                    self._analyze_text_file(file_path)
+            
+            def _analyze_image_file(self, image_path: str) -> None:
+                """Analyze an image file using Gemini Vision API."""
+                if not overlay_ref._prompt_sender:
+                    self.append_message("System", "Error: Cannot analyze image - agent not available")
+                    return
+                
+                # Use the agent's vision analysis method
+                # We'll need to call it via the prompt sender with a special format
+                prompt = f"[IMAGE_ANALYZE:{image_path}] What do you see in this image? Describe it in detail and help me understand what's in it."
+                try:
+                    overlay_ref._prompt_sender(prompt)
+                except Exception as exc:
+                    LOGGER.exception("Failed to analyze image: %s", exc)
+                    self.append_message("System", f"Failed to analyze image: {exc}")
+            
+            def _analyze_pdf_file(self, pdf_path: str) -> None:
+                """Extract text from PDF and analyze with Gemini."""
+                from pathlib import Path
+                try:
+                    # Try PyPDF2 first
+                    try:
+                        import PyPDF2
+                        with open(pdf_path, 'rb') as f:
+                            pdf_reader = PyPDF2.PdfReader(f)
+                            text_content = ""
+                            for page_num, page in enumerate(pdf_reader.pages):
+                                text_content += f"\n--- Page {page_num + 1} ---\n"
+                                text_content += page.extract_text()
+                    except ImportError:
+                        # Fallback: try pdfplumber
+                        try:
+                            import pdfplumber
+                            with pdfplumber.open(pdf_path) as pdf:
+                                text_content = ""
+                                for page_num, page in enumerate(pdf.pages):
+                                    text_content += f"\n--- Page {page_num + 1} ---\n"
+                                    text_content += page.extract_text() or ""
+                        except ImportError:
+                            self.append_message("System", "PDF parsing requires PyPDF2 or pdfplumber. Install with: pip install PyPDF2")
+                            return
+                    
+                    if not text_content.strip():
+                        self.append_message("System", "Could not extract text from PDF (might be image-based)")
+                        return
+                    
+                    # Send to Gemini for analysis (increased limit for long documents)
+                    # Truncate to 100k chars to allow for very long documents while staying within API limits
+                    truncated_text = text_content[:100000] if len(text_content) > 100000 else text_content
+                    if len(text_content) > 100000:
+                        truncated_text += f"\n\n[Note: Document truncated from {len(text_content)} to 100,000 characters]"
+                    prompt = f"I dropped a PDF file ({Path(pdf_path).name}). Here's the extracted text:\n\n{truncated_text}\n\nCan you analyze this document thoroughly and help me understand it? Please provide a comprehensive analysis."
+                    if overlay_ref._prompt_sender:
+                        try:
+                            overlay_ref._prompt_sender(prompt)
+                        except Exception as exc:
+                            LOGGER.exception("Failed to analyze PDF: %s", exc)
+                            self.append_message("System", f"Failed to analyze PDF: {exc}")
+                except Exception as exc:
+                    LOGGER.exception("Failed to read PDF: %s", exc)
+                    self.append_message("System", f"Failed to read PDF: {exc}")
+            
+            def _analyze_text_file(self, file_path: str) -> None:
+                """Read text file and analyze with Gemini."""
+                from pathlib import Path
+                try:
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                    
+                    if not content.strip():
+                        self.append_message("System", "File is empty")
+                        return
+                    
+                    file_name = Path(file_path).name
+                    # Send to Gemini for analysis (increased limit for long documents)
+                    # Truncate to 100k chars to allow for very long documents while staying within API limits
+                    truncated_content = content[:100000] if len(content) > 100000 else content
+                    if len(content) > 100000:
+                        truncated_content += f"\n\n[Note: File truncated from {len(content)} to 100,000 characters]"
+                    prompt = f"I dropped a file ({file_name}). Here's its content:\n\n{truncated_content}\n\nCan you analyze this thoroughly and help me understand it? Please provide a comprehensive analysis."
+                    if overlay_ref._prompt_sender:
+                        try:
+                            overlay_ref._prompt_sender(prompt)
+                        except Exception as exc:
+                            LOGGER.exception("Failed to analyze text file: %s", exc)
+                            self.append_message("System", f"Failed to analyze file: {exc}")
+                except Exception as exc:
+                    LOGGER.exception("Failed to read file: %s", exc)
+                    self.append_message("System", f"Failed to read file: {exc}")
+
             
             def keyPressEvent(self, event: QKeyEvent) -> None:
                 """Handle keyboard shortcuts."""
@@ -323,27 +511,131 @@ class SpeechBubbleOverlay:
                         self.append_message(msg["author"], msg["text"], persist=False)
             
             def export_to_markdown(self, path: Optional[str] = None) -> None:
-                """Export chat history as markdown."""
-                from pathlib import Path
-                from datetime import datetime
-                
-                if path is None:
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    path = f"chat_history_{timestamp}.md"
-                
+                """Export current chat session as markdown or JSON."""
                 try:
-                    with open(path, "w", encoding="utf-8") as f:
-                        f.write("# Chat History\n\n")
-                        for entry in self._chat_history:
-                            author = entry.get("author", "Unknown")
-                            text = entry.get("text", "")
-                            f.write(f"## {author}\n\n{text}\n\n")
-                    LOGGER.info("Chat history exported to %s", path)
-                    # Show confirmation
-                    self.append_message("System", f"Exported to {path}", persist=False)
+                    from pathlib import Path
+                    from PySide6.QtWidgets import QFileDialog
+                    
+                    # Default export directory
+                    export_dir = Path.cwd()
+                    default_filename = f"chat_export_{self._session_id}.md"
+                    default_path = str(export_dir / default_filename)
+                    
+                    if path is None:
+                        file_path, selected_filter = QFileDialog.getSaveFileName(
+                            self,
+                            "Export Chat Session",
+                            default_path,
+                            "Markdown (*.md);;JSON (*.json);;All Files (*)"
+                        )
+                        if not file_path or not isinstance(file_path, str):
+                            return
+                        path = file_path
+                    
+                    # Determine format from extension
+                    if isinstance(path, str):
+                        format_type = "json" if path.lower().endswith(".json") else "markdown"
+                    else:
+                        format_type = "markdown"
+                    
+                    # Export using database
+                    exported_path = self._chat_db.export_session_to_file(
+                        session_id=self._session_id,
+                        file_path=path,
+                        format=format_type
+                    )
+                    
+                    LOGGER.info("Chat session exported to %s", exported_path)
+                    self.append_message("System", f"Exported to {exported_path}", persist=False)
                 except Exception as exc:
-                    LOGGER.error("Failed to export chat history: %s", exc)
+                    LOGGER.error("Failed to export chat session: %s", exc)
                     self.append_message("System", f"Export failed: {exc}", persist=False)
+            
+            def open_exports_folder(self) -> None:
+                """Open the exports folder in the file manager."""
+                try:
+                    import subprocess
+                    from pathlib import Path
+                    
+                    export_dir = Path.cwd()
+                    
+                    # Try to open folder in default file manager
+                    import platform
+                    system = platform.system()
+                    
+                    if system == "Linux":
+                        # Try xdg-open first (works on most Linux)
+                        subprocess.Popen(["xdg-open", str(export_dir)], 
+                                       stdout=subprocess.DEVNULL, 
+                                       stderr=subprocess.DEVNULL)
+                    elif system == "Darwin":  # macOS
+                        subprocess.Popen(["open", str(export_dir)],
+                                       stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+                    elif system == "Windows":
+                        subprocess.Popen(["explorer", str(export_dir)],
+                                       stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+                    
+                    self.append_message("System", f"Opened folder: {export_dir}", persist=False)
+                except Exception as exc:
+                    LOGGER.error("Failed to open exports folder: %s", exc)
+                    self.append_message("System", f"Failed to open folder: {exc}", persist=False)
+            
+            def import_from_file(self) -> None:
+                """Import a chat session from a JSON file."""
+                try:
+                    from pathlib import Path
+                    from PySide6.QtWidgets import QFileDialog, QMessageBox
+                    
+                    # Default to current directory (where exports are typically saved)
+                    import_dir = str(Path.cwd().absolute())
+                    
+                    file_path, _ = QFileDialog.getOpenFileName(
+                        self,
+                        "Import Chat Session",
+                        import_dir,  # Start in current directory (where exports are saved)
+                        "JSON Files (*.json);;Markdown Files (*.md);;All Files (*)"
+                    )
+                    
+                    if not file_path:
+                        return
+                    
+                    # Ask user if they want to create new session or append to current
+                    reply = QMessageBox.question(
+                        self,
+                        "Import Chat",
+                        "Create a new session with imported messages?\n\n"
+                        "Yes = New session\nNo = Append to current session",
+                        QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel
+                    )
+                    
+                    if reply == QMessageBox.Cancel:
+                        return
+                    
+                    create_new = reply == QMessageBox.Yes
+                    
+                    # Import using database
+                    imported_session_id = self._chat_db.import_session(file_path, create_new=create_new)
+                    
+                    if create_new:
+                        # Switch to new session
+                        self._session_id = imported_session_id
+                        self._chat_history = self._chat_db.get_messages(self._session_id)
+                        # Reload UI
+                        self._history.clear()
+                        for msg in self._chat_history:
+                            self.append_message(msg["author"], msg["text"], persist=False)
+                    
+                    LOGGER.info("Chat session imported into session %d", imported_session_id)
+                    self.append_message(
+                        "System",
+                        f"Imported into session {imported_session_id}",
+                        persist=False
+                    )
+                except Exception as exc:
+                    LOGGER.error("Failed to import chat session: %s", exc)
+                    self.append_message("System", f"Import failed: {exc}", persist=False)
 
         # ============================================================
         # CHAT WINDOW #2: Bubble box (follows Shimeji, read-only)
@@ -456,7 +748,7 @@ class SpeechBubbleOverlay:
                 y = max(geometry.top() + 20, min(y, geometry.bottom() - self.height() - 20))
                 self.move(x, y)
 
-        chat_window = ChatWindow()
+        chat_window = ChatWindow(chat_db=chat_db)
         self._chat_window = chat_window  # Store reference for external access
         bubble_box = BubbleBox()
 

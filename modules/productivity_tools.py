@@ -10,23 +10,23 @@ from typing import Optional
 
 LOGGER = logging.getLogger(__name__)
 
-# Dangerous command patterns that should be blocked
+# Only block truly destructive commands that could cause immediate system damage
+# Allow sensitive but useful commands (like editing configs) - Gemini will warn first
 DANGEROUS_COMMANDS = {
-    "rm -rf",
-    "dd if=",
-    "mkfs",
-    "fdisk",
-    "format",
-    "> /dev/sd",
-    "shutdown",
-    "reboot",
-    "init 0",
-    "init 6",
-    "halt",
-    "poweroff",
-    "rm -f /",
-    "chmod -R 777",
-    "chown -R",
+    "rm -rf /",  # Only block root deletion, not regular rm -rf
+    "rm -f /",   # Only block root deletion
+    "dd if=",    # Block disk imaging that could overwrite drives
+    "mkfs",      # Block filesystem creation
+    "fdisk",     # Block disk partitioning
+    "> /dev/sd", # Block writing to raw disk devices
+    "shutdown",  # Block system shutdown
+    "reboot",    # Block system reboot
+    "init 0",    # Block system halt
+    "init 6",    # Block system reboot
+    "halt",      # Block system halt
+    "poweroff",  # Block system poweroff
+    "chmod -R 777 /",  # Only block system-wide permission changes
+    "chown -R root /", # Only block system-wide ownership changes
 }
 
 # Maximum clipboard content length to prevent paste attacks
@@ -163,25 +163,107 @@ class ProductivityTools:
     @staticmethod
     def get_battery_status() -> dict:
         """Get battery percentage and charging status."""
+        # Try to find the actual battery device
+        battery_devices = []
         try:
             result = subprocess.run(
-                ["upower", "-i", "/org/freedesktop/UPower/devices/battery_BAT0"],
+                ["upower", "-e"],
                 capture_output=True,
                 text=True,
                 timeout=2,
             )
             if result.returncode == 0:
-                output = result.stdout
-                percentage = None
-                state = None
-                for line in output.split("\n"):
-                    if "percentage:" in line:
-                        percentage = line.split(":")[1].strip()
-                    if "state:" in line:
-                        state = line.split(":")[1].strip()
-                return {"percentage": percentage, "state": state}
+                for line in result.stdout.split("\n"):
+                    if "battery" in line.lower():
+                        battery_devices.append(line.strip())
         except (subprocess.TimeoutExpired, FileNotFoundError):
-            LOGGER.debug("Battery info not available")
+            pass
+        
+        # If no devices found via upower -e, try common paths
+        if not battery_devices:
+            battery_devices = [
+                "/org/freedesktop/UPower/devices/battery_BAT1",
+                "/org/freedesktop/UPower/devices/battery_BAT0",
+            ]
+        
+        # Try each battery device until we find one with valid data
+        for device_path in battery_devices:
+            try:
+                result = subprocess.run(
+                    ["upower", "-i", device_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+                if result.returncode == 0:
+                    output = result.stdout
+                    percentage = None
+                    state = None
+                    power_supply = None
+                    energy = None
+                    energy_full = None
+                    
+                    for line in output.split("\n"):
+                        line_lower = line.lower()
+                        if "power supply:" in line_lower:
+                            power_supply = line.split(":")[1].strip().lower()
+                        if "percentage:" in line:
+                            pct_str = line.split(":")[1].strip()
+                            # Skip if it says "should be ignored"
+                            if "should be ignored" not in line_lower:
+                                # Extract numeric value (e.g., "85%" -> 85)
+                                try:
+                                    percentage = float(pct_str.rstrip("%"))
+                                except ValueError:
+                                    percentage = pct_str
+                        if "state:" in line and "battery" in line_lower:
+                            state = line.split(":")[1].strip()
+                        # Calculate from energy if percentage not available
+                        if "energy:" in line_lower and "energy-empty" not in line_lower and "energy-full" not in line_lower:
+                            try:
+                                energy = float(line.split(":")[1].strip().split()[0])
+                            except (ValueError, IndexError):
+                                pass
+                        if "energy-full:" in line_lower:
+                            try:
+                                energy_full = float(line.split(":")[1].strip().split()[0])
+                            except (ValueError, IndexError):
+                                pass
+                    
+                    # Calculate percentage from energy if not directly available
+                    if percentage is None and energy is not None and energy_full is not None and energy_full > 0:
+                        percentage = (energy / energy_full) * 100
+                    
+                    # Only return if we have a valid power supply (yes) and percentage
+                    if power_supply == "yes" and percentage is not None:
+                        # Check if percentage is actually valid (not 0% with "should be ignored")
+                        if isinstance(percentage, (int, float)) and percentage >= 0:
+                            return {"percentage": f"{percentage:.0f}%", "state": state}
+                        elif isinstance(percentage, str):
+                            return {"percentage": percentage, "state": state}
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                continue
+            except Exception as exc:
+                LOGGER.debug("Error checking battery device %s: %s", device_path, exc)
+                continue
+        
+        # Fallback: try /sys/class/power_supply if upower fails
+        try:
+            for battery_dir in Path("/sys/class/power_supply").glob("BAT*"):
+                capacity_file = battery_dir / "capacity"
+                status_file = battery_dir / "status"
+                if capacity_file.exists():
+                    with open(capacity_file, "r") as f:
+                        percentage = f.read().strip()
+                    state = None
+                    if status_file.exists():
+                        with open(status_file, "r") as f:
+                            state = f.read().strip()
+                    return {"percentage": f"{percentage}%", "state": state}
+        except Exception as exc:
+            LOGGER.debug("Error reading /sys/class/power_supply: %s", exc)
+        
+        LOGGER.debug("Battery info not available")
         return {}
 
     @staticmethod

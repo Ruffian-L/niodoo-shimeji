@@ -416,6 +416,7 @@ class DualModeAgent:
         self._recent_actions: Deque[str] = deque(maxlen=20)
         self.overlay = SpeechBubbleOverlay()
         self.overlay.set_prompt_sender(self._submit_cli_prompt)
+        self._greeting_shown = False  # Flag to prevent duplicate greetings
         try:
             self._anchor_poll_interval = max(0.1, float(os.getenv("SHIMEJI_ANCHOR_POLL", "0.5")))
         except ValueError:
@@ -479,9 +480,6 @@ class DualModeAgent:
         self.overlay.start()
         self.overlay.update_anchor(None, None)
         self.overlay.open_chat_panel()
-        self.overlay.show_chat_message(
-            "Gemini", "Hi! I'm your Shimeji companion. Ask me anything or click Send to chat."
-        )
 
         mascot_ready = await asyncio.to_thread(
             self.desktop_controller.wait_for_mascot,
@@ -495,12 +493,25 @@ class DualModeAgent:
                 "I can't see a mascot yet. Once you spawn or select one I'll start moving!",
             )
         else:
-            self.desktop_controller.show_dialogue(
-                "I'm awake and ready! Use the chat panel or click me if you need help.",
-                duration=8,
-                author="Shimeji",
-            )
-            self._dispatch_dialogue()
+            # Single greeting message - shown in both bubble and chat panel
+            # Only show once (flag set in __init__)
+            if not self._greeting_shown:
+                greeting_text = (
+                    "I'm awake and ready to help! 🚀\n\n"
+                    "• Ask me to run bash commands or help with tasks\n"
+                    "• Drag & drop files (images, PDFs, code) into chat for analysis\n"
+                    "• Click the 📋 button to ask about your clipboard\n"
+                    "• I can analyze screenshots, monitor system status, and more!\n\n"
+                    "Just type in the chat or click me to get started!"
+                )
+                self.desktop_controller.show_dialogue(
+                    greeting_text,
+                    duration=12,
+                    author="Shimeji",
+                )
+                # Mark greeting as shown BEFORE dispatching to prevent duplicates
+                self._greeting_shown = True
+                self._dispatch_dialogue()
             anchor_initial = await asyncio.to_thread(self.desktop_controller.get_primary_mascot_anchor)
             if anchor_initial:
                 self.overlay.update_anchor(*anchor_initial)
@@ -753,6 +764,32 @@ class DualModeAgent:
         self._loop.call_soon_threadsafe(_dispatch, prompt)
 
     async def _process_cli_prompt(self, prompt: str) -> None:
+        # Check if this is an image analysis request
+        if prompt.startswith("[IMAGE_ANALYZE:"):
+            # Extract image path and question
+            import re
+            match = re.match(r'\[IMAGE_ANALYZE:(.+?)\]\s*(.*)', prompt)
+            if match:
+                image_path = match.group(1)
+                question = match.group(2) or "What do you see in this image? Describe it in detail."
+                # Show typing indicator
+                if hasattr(self.overlay, '_chat_window') and self.overlay._chat_window:
+                    self.overlay._chat_window.show_typing()
+                try:
+                    analysis = await self._analyze_image_with_vision(image_path, question)
+                    if hasattr(self.overlay, '_chat_window') and self.overlay._chat_window:
+                        self.overlay._chat_window.hide_typing()
+                    if analysis:
+                        self.overlay.show_chat_message("Shimeji", f"Image Analysis:\n{analysis}")
+                    else:
+                        self.overlay.show_chat_message("Shimeji", "Couldn't analyze image.")
+                except Exception as exc:
+                    LOGGER.exception("Image analysis failed: %s", exc)
+                    if hasattr(self.overlay, '_chat_window') and self.overlay._chat_window:
+                        self.overlay._chat_window.hide_typing()
+                    self.overlay.show_chat_message("Shimeji", f"Failed to analyze image: {exc}")
+                return
+        
         # Show typing indicator
         if hasattr(self.overlay, '_chat_window') and self.overlay._chat_window:
             self.overlay._chat_window.show_typing()
@@ -766,11 +803,15 @@ class DualModeAgent:
             
             if response:  # Only show if there's actual text
                 response = self._add_emojis(response)
-                # Full response to panel
+                # Full response to panel (only once - no duplicates)
                 self.overlay.show_chat_message("Shimeji", response)
-                # Short version to bubble
-                short_response = ' '.join(response.split()[:20]) + '...' if len(response.split()) > 20 else response
-                self.overlay.show_bubble_message("Shimeji", short_response, duration=8)
+                # Short version to bubble (only if response is short enough)
+                if len(response.split()) <= 30:
+                    self.overlay.show_bubble_message("Shimeji", response, duration=8)
+                else:
+                    # For long responses, just show a brief bubble
+                    short_response = ' '.join(response.split()[:15]) + '...'
+                    self.overlay.show_bubble_message("Shimeji", short_response, duration=5)
         except (genai_types.BlockedPromptException, genai_types.StopCandidateException) as exc:
             LOGGER.warning("Gemini API error: %s", exc)
             if hasattr(self.overlay, '_chat_window') and self.overlay._chat_window:
@@ -894,8 +935,9 @@ class DualModeAgent:
             "5. Vary behaviours and dialogue to avoid repetition.\n"
             "6. Use the emotional state to guide decisions (high boredom -> fun actions or a quick chat,"
             " low energy -> restful actions).\n"
-            "7. When things are quiet, feel free to share a light observation or tip with show_dialogue.\n"
-            "8. Proactively use your tools: check battery when bored, read clipboard if user is copying code, take screenshots to help debug.\n"
+            "7. When things are quiet, feel free to share a light observation or tip with show_dialogue, but keep it minimal - don't spam the chat.\n"
+            "8. Proactively use your tools: check battery when bored, take screenshots to help debug. DO NOT read clipboard automatically - users will request it manually.\n"
+            "9. Keep dialogue messages SHORT and INFREQUENT - don't flood the chat with messages. Be quiet most of the time.\n"
         ).format(personality=personality.replace("_", " "))
 
     def _get_state_reaction(self, current: str, previous: Optional[str]) -> Optional[str]:
@@ -1001,8 +1043,11 @@ class DualModeAgent:
                 duration = 6
             # Show bubble above Shimeji
             self.overlay.show_bubble_message(author, text, duration=duration)
-            # Also add to chat panel
-            self.overlay.show_chat_message(author, text)
+            # Only add to chat panel if it's the initial greeting (to reduce spam)
+            # Proactive dialogue should only show in bubbles, not chat
+            if hasattr(self, '_greeting_shown') and not self._greeting_shown:
+                self.overlay.show_chat_message(author, text)
+                self._greeting_shown = True
 
 
 async def main() -> None:

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# NiodooLocal Installation Script
-# Installs NiodooLocal project, Shijima-Qt, and configures environment
+# niodoo-shimeji Installation Script
+# Installs niodoo-shimeji project, Shijima-Qt, and configures environment
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SHIJIMA_QT_REPO="https://github.com/pixelomer/Shijima-Qt.git"
@@ -10,7 +10,7 @@ SHIJIMA_QT_DIR="${ROOT_DIR}/Shijima-Qt"
 BASH_RC="${HOME}/.bashrc"
 
 echo "=========================================="
-echo "NiodooLocal Installation Script"
+echo "niodoo-shimeji Installation Script"
 echo "=========================================="
 echo ""
 
@@ -181,7 +181,7 @@ echo ""
 echo "[5/7] Configuring bash environment..."
 if ! grep -q "QT_QPA_PLATFORM=xcb" "${BASH_RC}" 2>/dev/null; then
     echo "" >> "${BASH_RC}"
-    echo "# NiodooLocal: Set Qt platform to xcb" >> "${BASH_RC}"
+    echo "# niodoo-shimeji: Set Qt platform to xcb" >> "${BASH_RC}"
     echo "export QT_QPA_PLATFORM=xcb" >> "${BASH_RC}"
     echo "  ✓ Added QT_QPA_PLATFORM=xcb to ${BASH_RC}"
 else
@@ -189,9 +189,9 @@ else
 fi
 
 # Add alias/function for killing shimeji agent
-if ! grep -q "# NiodooLocal: Kill shimeji agent" "${BASH_RC}" 2>/dev/null; then
+if ! grep -q "# niodoo-shimeji: Kill shimeji agent" "${BASH_RC}" 2>/dev/null; then
     echo "" >> "${BASH_RC}"
-    echo "# NiodooLocal: Kill shimeji agent" >> "${BASH_RC}"
+    echo "# niodoo-shimeji: Kill shimeji agent" >> "${BASH_RC}"
     echo "alias kill-shimeji='pkill -f shimeji_dual_mode_agent.py'" >> "${BASH_RC}"
     echo "  ✓ Added kill-shimeji alias to ${BASH_RC}"
 else
@@ -199,9 +199,9 @@ else
 fi
 
 # Add alias for running shim
-if ! grep -q "# NiodooLocal: Run shim command" "${BASH_RC}" 2>/dev/null; then
+if ! grep -q "# niodoo-shimeji: Run shim command" "${BASH_RC}" 2>/dev/null; then
     echo "" >> "${BASH_RC}"
-    echo "# NiodooLocal: Run shim command" >> "${BASH_RC}"
+    echo "# niodoo-shimeji: Run shim command" >> "${BASH_RC}"
     echo "alias shim='${ROOT_DIR}/shim'" >> "${BASH_RC}"
     echo "  ✓ Added shim alias to ${BASH_RC}"
 else

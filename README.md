@@ -1,10 +1,10 @@
-# NiodooLocal 🎭
+# niodoo-shimeji 🎭
 
 **An autonomous, embodied AI desktop companion powered by Google Gemini**
 
 A project by [Niodoo.com](https://niodoo.com) - Building actually helpful Intelligence.
 
-NiodooLocal brings a Shimeji desktop pet to life with real AI intelligence. Your desktop companion can see your screen, understand context, help with tasks, and interact with you through an animated character that actually thinks and responds.
+niodoo-shimeji brings a Shimeji desktop pet to life with real AI intelligence. Your desktop companion can see your screen, understand context, help with tasks, analyze documents, and interact with you through an animated character that actually thinks and responds.
 
 ![Shimeji Companion](https://img.shields.io/badge/Shimeji-AI%20Powered-blue)
 ![Python](https://img.shields.io/badge/Python-3.10+-green)
@@ -26,16 +26,20 @@ NiodooLocal brings a Shimeji desktop pet to life with real AI intelligence. Your
 
 ### 🧠 AI Capabilities
 - **Vision AI**: Can analyze screenshots to help debug code, read UI elements, or understand what's on screen
-- **System Access**: Reads clipboard, executes bash commands (safely), monitors system status
-- **Memory System**: Remembers past interactions and context
+- **Document Analysis**: Drag-and-drop files (images, PDFs, markdown, code files) directly into chat for Gemini to analyze
+- **Function Calling with Chaining**: Real Gemini CLI-style tool chaining - Gemini can execute multiple commands in sequence (e.g., find file → verify → delete)
+- **System Access**: Reads clipboard (on-demand), executes bash commands (safely), monitors system status
+- **Memory System**: SQLite-based chat history with session management, import/export functionality
 - **Privacy-First**: Automatically filters sensitive information before sending to AI
 
 ### 🛠️ Productivity Tools
-- Screenshot capture and analysis
-- Clipboard reading
-- System monitoring (battery, CPU, memory)
-- Bash command execution with safety validation
-- Wikipedia fact fetching
+- **Drag-and-Drop File Analysis**: Drop images, PDFs, markdown, code files into chat for instant analysis
+- **Screenshot capture and analysis**: Vision AI understands what's on your screen
+- **Clipboard button**: Manual clipboard reading with dedicated button (no automatic snooping)
+- **System monitoring**: Battery, CPU, memory status with smart alerts
+- **Bash command execution**: Safe command validation with function chaining support
+- **Wikipedia fact fetching**: Random facts to share
+- **Chat history management**: SQLite database with import/export (JSON/Markdown)
 
 ## 🚀 Quick Start
 
@@ -102,8 +106,15 @@ pkill -f shimeji_dual_mode_agent.py
 
 ### Chat Interface
 
-- **Chat Panel**: Docked window for full conversations
-- **Speech Bubbles**: Quick pop-ups above the Shimeji character
+- **Chat Panel**: Docked window for full conversations with persistent SQLite history
+- **Speech Bubbles**: Quick pop-ups above the Shimeji character (proactive messages only show here, not in chat)
+- **Drag-and-Drop**: Drop files directly into the chat window for analysis:
+  - **Images**: PNG, JPG, GIF, WebP, etc. - analyzed with Vision API
+  - **PDFs**: Text extraction and analysis (requires `pip install PyPDF2`)
+  - **Text Files**: Markdown, code files, configs - read and analyzed
+- **Clipboard Button (📋)**: Click to ask Gemini about your clipboard content
+- **Import/Export**: Save chat sessions as JSON or Markdown, import previous conversations
+- **Search**: Search through chat history
 - **Keyboard Shortcuts**:
   - `Escape`: Hide chat panel
   - `Ctrl+Enter`: Submit message
@@ -212,14 +223,18 @@ python -m unittest discover tests
 ### Project Structure
 
 ```
-NiodooLocal/
+niodoo-shimeji/
 ├── modules/              # Core modules
-│   ├── brains/          # AI brain implementations
+│   ├── brains/          # AI brain implementations (ProactiveBrain, CLIBrain)
+│   ├── chat_database.py # SQLite chat history management
 │   ├── context_sniffer.py
 │   ├── desktop_controller.py
 │   ├── memory_manager.py
+│   ├── speech_bubble.py # Qt overlay with drag-and-drop support
+│   ├── productivity_tools.py
 │   └── ...
 ├── tests/               # Test suite
+├── var/                 # Runtime data (chat database, etc.)
 ├── shimeji_dual_mode_agent.py  # Main entry point
 ├── install.sh           # Installation script
 ├── shim                 # Convenience launcher
@@ -292,8 +307,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 📚 Documentation
 
 - [CHANGELOG.md](CHANGELOG.md) - Detailed change history
-- [CODE_REVIEW.md](CODE_REVIEW.md) - Code quality review
-- [ENHANCEMENT_REVIEW.md](ENHANCEMENT_REVIEW.md) - Future enhancements
 
 ## 💬 Support
 

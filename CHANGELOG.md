@@ -2,6 +2,150 @@
 
 ## 2025-01-15
 
+### Repository Cleanup - Removed Legacy Code and Development Documents
+
+- **Removed development artifacts**: Deleted temporary markdown files that were cluttering the repository:
+  - `CODE_REVIEW.md` - Code review document (development artifact, no longer needed)
+  - `ENHANCEMENT_REVIEW.md` - Enhancement review document (development artifact, no longer needed)
+  - `RENAME_GUIDE.md` - Folder rename guide (temporary documentation, no longer needed)
+  - `cpp-qt-brain-integration/IMPLEMENTATION_SUMMARY.md` - Implementation summary (historical documentation, no longer needed)
+  - `cpp-qt-brain-integration/TEST_PLAN.md` - Test plan document (outdated, no longer needed)
+- **Removed legacy Python files**: Deleted old agent implementations replaced by `shimeji_dual_mode_agent.py`:
+  - `gemini_shimeji_agent.py` (295 lines) - Old single-mode agent, replaced by dual-mode agent
+  - `niodoo_shimeji_bridge.py` (225 lines) - Old bridge, functionality integrated into dual-mode agent
+- **Removed legacy C++ code**: Deleted unused BrainIntegration application and related components:
+  - `cpp-qt-brain-integration/src/main.cpp` - Old BrainIntegration entry point
+  - `cpp-qt-brain-integration/src/MainWindow.cpp` - Unused main window
+  - `cpp-qt-brain-integration/src/EmotionalAIManager.cpp` - Unused emotional AI manager
+  - `cpp-qt-brain-integration/src/BrainSystemBridge.cpp` - Unused brain system bridge
+  - `cpp-qt-brain-integration/src/NeuralNetworkEngine.cpp` - Unused neural network engine
+  - `cpp-qt-brain-integration/src/NiodoPerformanceOptimizer.cpp` - Unused performance optimizer
+  - `cpp-qt-brain-integration/src/RustBrainBridge.cpp` - Unused Rust bridge
+  - All corresponding header files (MainWindow.h, EmotionalAIManager.h, BrainSystemBridge.h, NeuralNetworkEngine.h, NiodoPerformanceOptimizer.h, RustBrainBridge.h)
+- **Updated CMakeLists.txt**: Removed BrainIntegration executable build configuration, removed ONNX Runtime dependencies (not used by ShimejiCompanion), simplified to only build ShimejiCompanion
+- **Fixed README.md**: Removed references to deleted CODE_REVIEW.md and ENHANCEMENT_REVIEW.md files
+- **Professional repository**: Repository now contains only production code and documentation (README, CHANGELOG, LICENSE) and essential subproject documentation
+- **Cleaner structure**: Removed ~1000+ lines of legacy code and documentation to make repository more professional and ready for git commit/push
+
+## 2025-01-15
+
+### Fixed Duplicate Message Spam
+
+- **Single candidate processing**: Only process the first candidate from Gemini responses to prevent duplicate messages
+- **Sentence deduplication**: Added smart deduplication to remove exact duplicate sentences from responses
+- **Better text combining**: Improved logic for combining multiple text parts from Gemini into a single coherent message
+- **No more spam**: Fixed issue where "Got it. I've read the document..." and other messages were appearing twice
+
+### Improved Helpfulness for Real Questions
+
+- **Updated CLI brain prompt**: Modified system instruction to prioritize helpfulness over personality when users ask real questions
+- **Context-aware personality**: 
+  - Casual chat: Can still be playful and slightly tsundere
+  - Real questions/technical help: Direct, clear, and helpful - minimal teasing
+- **User-focused**: When people need actual help, Gemini now focuses on being useful rather than cute
+- **Clear instructions**: Explicitly tells Gemini to minimize tsundere/playfulness when providing real assistance
+- **Better UX**: Users get answers without annoying personality getting in the way
+
+### Fixed Function Calling Response Format Error
+
+- **Fixed `'str' object has no attribute 'items'` error**: Gemini API expects function response to be a structured value (dict), not a plain string
+- **Proper response format**: Function responses are now wrapped in `{"result": response_string}` structure
+- **Function chaining now works**: Fixed the error that was preventing function call chaining from working properly
+
+### Drag-and-Drop File Analysis (Enhanced for Long Documents)
+
+- **Drag-and-drop support**: Chat window now accepts file drops for analysis
+- **Image analysis**: Drop images (PNG, JPG, GIF, etc.) and Gemini will analyze them using Vision API
+- **PDF support**: Drop PDF files and Gemini will extract text and analyze the document (requires PyPDF2 or pdfplumber)
+- **Text file support**: Drop markdown, code files, text files, and more - Gemini will read and analyze them
+- **Supported formats**: Images (all formats), PDFs, Markdown (.md), code files (.py, .js, .ts, .html, .css, etc.), text files (.txt), config files (.json, .yaml, .xml), and more
+- **Automatic file type detection**: Uses MIME types and file extensions to determine how to handle each file
+- **User feedback**: Shows file name when dropped and analysis results in chat
+- **Long document support**: Increased content limit from 10k to 100k characters for analyzing very long documents
+- **Increased token limit**: Set `max_output_tokens` to 8192 so Gemini can provide comprehensive analysis of long documents
+- **Better prompts**: File analysis prompts now explicitly ask for "thorough" and "comprehensive" analysis
+
+### Reduced Chat Spam & Fixed Duplicate Greetings
+
+- **Removed automatic clipboard reading**: Proactive brain no longer has `read_clipboard` tool - users must manually request it
+- **Added clipboard button (📋)**: New button in chat UI that reads clipboard and asks Gemini about it
+- **Reduced chat spam**: Proactive dialogue messages now only show in speech bubbles, NOT in chat panel (except initial greeting)
+- **Fixed duplicate greeting**: Greeting flag is now set before dispatching to prevent duplicates
+- **Less verbose proactive brain**: Updated instructions to keep dialogue SHORT and INFREQUENT - "Be quiet most of the time"
+
+### Enhanced Function Calling with Chaining Support (Real Gemini CLI-style)
+
+- **Multi-step function calling loop**: CLI brain now implements proper function calling chaining like the real Gemini CLI
+- **Automatic iteration loop**: Up to 10 function calls can be chained in sequence - Gemini calls function → sees result → calls next function → etc.
+- **Proper function response format**: Function execution results are properly formatted and added to conversation history in the correct Gemini API format
+- **Function result feedback**: Each function call's output is fed back into the conversation so Gemini can see results and make decisions for the next call
+- **Improved execute_bash description**: Made it crystal clear that commands WILL BE EXECUTED - "This ACTUALLY RUNS the command - use it to delete files, edit configs, run scripts, etc."
+- **Real tool chaining examples**: Gemini can now do: `ls ~/Desktop/*prime*.py` → see file exists → `rm ~/Desktop/prime_counter.py` → verify deleted, all in one turn
+- **Better command execution**: When user confirms a delete/edit operation, Gemini will actually execute it instead of just describing what it would do
+- **Debug logging**: Added logging to track function call chaining iterations and help debug issues
+
+### Fixed Battery Status Detection
+
+- **Auto-detect battery device**: Now automatically finds the correct battery device instead of hardcoding BAT0
+- **Smart device selection**: Tries all battery devices and uses the one with `power supply: yes` (real battery)
+- **Skip invalid batteries**: Ignores devices that show "should be ignored" or have `power supply: no`
+- **Calculate from energy**: If percentage line is missing, calculates percentage from energy/energy-full values
+- **Fallback to /sys**: Falls back to reading `/sys/class/power_supply/BAT*/capacity` if upower fails
+- **Fixed 0% bug**: No longer shows 0% from invalid battery devices (like BAT0 when BAT1 is the real battery)
+
+### Allow Sensitive Commands with Warnings
+
+- **Updated command execution rules**: Gemini can now run sensitive commands (like editing SSH config, system files, etc.) but must warn first
+- **Warning and confirmation flow**: 
+  - For sensitive commands: Gemini warns user about what it will do
+  - Asks for confirmation (user says "proceed", "yes", "go ahead", etc.)
+  - Then executes the command if confirmed
+- **Relaxed command blocking**: Only truly destructive commands are blocked (like `rm -rf /`, `shutdown`, etc.)
+- **Allowed sensitive operations**: Editing config files, SSH config, system configs, installing packages, etc. are now allowed with warnings
+- **User control**: Users can now get help with system administration tasks without Gemini refusing
+
+### Enhanced Shim Script with Process Cleanup
+
+- **Automatic process cleanup**: `shim` script now automatically finds and kills old processes before starting
+- **Kills multiple process types**:
+  - Old `shimeji_dual_mode_agent.py` processes
+  - Old `shijima-qt` processes  
+  - Any Python processes running the agent script
+- **Graceful shutdown**: Attempts graceful kill first, then force kill (SIGKILL) if processes don't exit
+- **Clean startup**: Waits for processes to clean up before starting new instance
+- **Status messages**: Shows what it's doing (killing old processes, starting fresh, etc.)
+- **Prevents conflicts**: Ensures no duplicate processes or background zombies interfere with new instance
+
+### Fixed Duplicate Greeting Messages
+
+- **Removed duplicate greeting**: Fixed issue where two greeting messages were appearing in chat panel on startup
+- **Single greeting**: Now shows only one greeting message ("Shimeji: I'm awake and ready!") that appears in both the speech bubble and chat panel
+- **Cleaner startup**: Removed redundant "Gemini: Hi! I'm your Shimeji companion..." message that was duplicating the Shimeji greeting
+
+### SQLite Chat Database with Import/Export
+
+- **Created `modules/chat_database.py`**: Comprehensive SQLite-based chat management system with:
+  - Multiple chat session support (each `shim` run creates a new session)
+  - Session metadata (title, creation time, message counts)
+  - Message storage with timestamps and author tracking
+  - Import/export functionality (JSON and Markdown formats)
+  - Session listing and management
+  - Graceful session creation on startup
+- **Updated `modules/speech_bubble.py`**: 
+  - Replaced JSON file storage with SQLite database
+  - Added Import button alongside Export button in chat UI
+  - Added folder button (📁) to open exports directory in file manager
+  - Import dialog automatically opens in current directory (where exports are saved)
+  - Export dialog defaults to current directory with sensible filename
+  - Fixed export error where path type checking was incorrect
+  - Automatic new session creation each time `shim` is run
+  - Export supports both Markdown and JSON formats via file dialog
+  - Import allows creating new session or appending to current session
+  - Real-time database persistence (no more debounced saves)
+  - Session-aware message loading and filtering
+- **Database Location**: `var/chat_history.db` (automatically created)
+- **Backward Compatibility**: Old `chat_history.json` files are ignored (database takes precedence)
+
 ### Credits & Attribution Updates
 
 - **Added Niodoo.com attribution**: Updated README, LICENSE, and all documentation to credit Niodoo.com as the project creator

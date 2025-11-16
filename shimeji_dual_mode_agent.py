@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
-import json
 import logging
 import multiprocessing
 import os
@@ -357,14 +356,11 @@ class DualModeAgent:
             self.desktop_controller,
             self.ui_event_sink,
         )
-        self._file_handler = FileHandler(self.proactive_brain, self.memory, self.emotions, self._execute_decision)
-
         # Ensure recent actions deque exists before passing it to the file handler
         # (the file handler expects a list of recent actions; if this is not
         # yet initialized an AttributeError will be raised). Initialize here so
         # it's available to other components at startup.
         self._recent_actions: Deque[str] = deque(maxlen=20)
-        self._file_handler.set_context(self._latest_context, list(self._recent_actions))
 
         self.mode = AgentMode.PROACTIVE
         self._mode_lock = asyncio.Lock()
@@ -399,10 +395,25 @@ class DualModeAgent:
         # AgentCore already hosts a subset of the brain; expanding soon.
         self.core = AgentCore(
             cli_brain=self.cli_brain,
+            proactive_brain=self.proactive_brain,
             avatar_client=self.avatar_client,
             ui_event_sink=self.ui_event_sink,
             process_pool=self._process_pool,
+            memory=self.memory,
+            emotions=self.emotions,
+            metrics=self._metrics,
+            permission_manager=self._permission_manager,
+            take_screenshot=ProductivityTools.take_screenshot,
+            merge_context=self._merge_latest_context,
+            set_latest_vision_analysis=self._set_latest_vision_analysis,
+            context_getter=self._get_context_snapshot,
+            transition_mascot_state=self._transition_mascot_state,
+            event_bus=self._event_bus,
+            decision_executor=self._decision_executor,
         )
+
+        self._file_handler = FileHandler(self.proactive_brain, self.memory, self.emotions, self.core.execute_decision)
+        self._file_handler.set_context(self._latest_context, list(self._recent_actions))
         
         # Initialize hybrid privacy filter with process pool
         try:
@@ -546,7 +557,13 @@ class DualModeAgent:
             os.getenv("VISION_ANALYSIS_INTERVAL", str(DEFAULT_VISION_ANALYSIS_INTERVAL_SECONDS))
         )
         if vision_interval > 0:
-            self._vision_analysis_task = asyncio.create_task(self._vision_analysis_loop(vision_interval))
+            self._vision_analysis_task = asyncio.create_task(
+                self.core.vision_analysis_loop(
+                    self,
+                    interval=vision_interval,
+                    is_running=lambda: self._running,
+                )
+            )
         
         # Start system monitoring
         await self._monitoring_manager.start()
@@ -660,26 +677,16 @@ class DualModeAgent:
         self._context_manager._update_context(merged)
         return merged
 
+    def _set_latest_vision_analysis(self, analysis: Optional[Dict[str, Any]]) -> None:
+        self._latest_vision_analysis = analysis
+
+    async def _analyze_image_with_vision(self, image_path: str, question: str) -> Optional[str]:
+        return await self.core._analyze_image_with_vision(image_path, question)
+
     async def get_latest_context(self) -> Dict[str, Any]:
         """Public helper for collaborators needing the current context."""
         return await self._get_context_snapshot()
 
-    def _parse_vision_analysis(self, analysis: str) -> Optional[Dict[str, Any]]:
-        """Extract JSON payload from a Gemini vision response string."""
-        if "{" not in analysis or "}" not in analysis:
-            return None
-        json_start = analysis.find("{")
-        json_end = analysis.rfind("}")
-        if json_start == -1 or json_end == -1 or json_end <= json_start:
-            return None
-        json_str = analysis[json_start:json_end + 1]
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError as exc:
-            LOGGER.warning("Vision analysis JSON decode failed: %s", exc)
-            LOGGER.debug("Vision analysis payload: %s", analysis)
-            return None
-    
     async def _watch_config(self) -> None:
         """Watch for configuration file changes."""
         try:
@@ -748,50 +755,15 @@ class DualModeAgent:
             self._show_alert_notification(alert)
     
     async def _handle_critical_alert(self, alert: SystemAlert) -> None:
-        """Handle critical alert by triggering proactive Gemini decision."""
-        # Rate limit critical alert proactive decisions (max once per 5 minutes per alert type)
-        cache_key = f"critical_alert:{alert.alert_type}"
-        now = time.monotonic()
-        last_critical = self._critical_alert_cache.get(cache_key, 0)
-        
-        rate_limit_seconds = 300  # 5 minutes
-        if now - last_critical < rate_limit_seconds:
-            LOGGER.debug("Critical alert proactive decision rate limited: %s", alert.alert_type)
-            # Still show notification even if rate limited
-            self._show_alert_notification(alert)
-            return
-        
-        self._critical_alert_cache[cache_key] = now
-        
-        try:
-            # Build context for proactive decision
-            context = await self._get_context_snapshot()
-            context["system_alert"] = {
-                "type": alert.alert_type,
-                "message": alert.message,
-                "details": alert.details,
-            }
-            
-            # Get current system state
-            working_summary = self.memory.recent_observations()
-            episodic_summary = await self.memory.recall_relevant_async(context)
-            
-            # Make proactive decision with alert context
-            decision = await self.proactive_brain.decide(
-                context,
-                self._recent_actions,
-                working_summary,
-                episodic_summary,
-                self.emotions.snapshot(),
-            )
-            
-            # Execute the decision
-            await self._execute_decision(decision, context)
-            
-        except Exception as exc:
-            LOGGER.error("Failed to handle critical alert: %s", exc)
-            # Fallback to notification
-            self._show_alert_notification(alert)
+        """Delegate critical alert handling to AgentCore."""
+        context = await self._get_context_snapshot()
+        await self.core.handle_critical_alert(
+            alert,
+            cache=self._critical_alert_cache,
+            context=context,
+            recent_actions=self._recent_actions,
+            show_alert_notification=self._show_alert_notification,
+        )
     
     def _show_alert_notification(self, alert: SystemAlert) -> None:
         """Show alert notification in speech bubble and chat."""
@@ -894,101 +866,6 @@ class DualModeAgent:
     
 
     
-    async def _vision_analysis_loop(self, interval: int) -> None:
-        """Proactive screen context analysis loop (P2.2).
-        
-        Args:
-            interval: Seconds between vision analyses
-        """
-        while self._running:
-            try:
-                await asyncio.sleep(interval)
-                if not self._running:
-                    break
-                
-                # Check permission before screenshot
-                if hasattr(self, '_permission_manager') and self._permission_manager:
-                    from modules.permission_manager import PermissionScope, PermissionStatus
-                    agent_id = "ProactiveBrain"
-                    permission = await self._permission_manager.check_permission_async(
-                        agent_id, PermissionScope.CONTEXT_VISION_READ_SCREEN
-                    )
-                    if permission == PermissionStatus.DENY:
-                        LOGGER.debug("Vision analysis denied by permission")
-                        continue
-                
-                # Take screenshot
-                from modules.productivity_tools import ProductivityTools
-                screenshot_path = ProductivityTools.take_screenshot()
-                if not screenshot_path:
-                    continue
-                
-                # Analyze with Gemini Vision
-                prompt = (
-                    "Analyze this desktop screenshot. Identify the active application, "
-                    "window title, and any key UI elements or text. Based on this, "
-                    "what is the user's most likely current task? Also detect any error "
-                    "messages, pop-up dialogs, or stack traces. If found, extract the "
-                    "full text of the error. Respond with JSON: "
-                    "{'app': '...', 'task': '...', 'file': '...', 'error_text': '...'}"
-                )
-                
-                analysis = await self._analyze_image_with_vision(str(screenshot_path), prompt)
-                if analysis:
-                    try:
-                        parsed = self._parse_vision_analysis(analysis)
-                        if parsed:
-                            self._latest_vision_analysis = parsed
-                            await self._merge_latest_context({"vision_analysis": parsed})
-
-                            # Check for errors (P2.3)
-                            if parsed.get("error_text"):
-                                await self._handle_detected_error(parsed["error_text"])
-                        else:
-                            LOGGER.debug("Vision analysis returned unstructured content; caching raw output")
-                            self._latest_vision_analysis = {"raw": analysis}
-                            await self._merge_latest_context({"vision_analysis": self._latest_vision_analysis})
-                    except Exception as exc:
-                        LOGGER.error("Vision analysis parsing error: %s", exc)
-                        self._latest_vision_analysis = {"raw": analysis}
-                        await self._merge_latest_context({"vision_analysis": self._latest_vision_analysis})
-                
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                LOGGER.error("Vision analysis loop error: %s", exc)
-                await asyncio.sleep(interval)  # Wait before retry
-    
-    async def _handle_detected_error(self, error_text: str) -> None:
-        """Handle autonomously detected error (P2.3).
-        
-        Args:
-            error_text: Extracted error text from vision analysis
-        """
-        # Trigger high-priority proactive decision
-        context = await self._get_context_snapshot()
-        context["detected_error"] = error_text
-        
-        working_summary = self.memory.recent_observations()
-        
-        # Specialized prompt for error resolution
-        error_prompt = (
-            f"The user just encountered this error on their screen: {error_text}\n\n"
-            "1. Explain this error in simple terms.\n"
-            "2. Provide 3 concrete, step-by-step solutions the user might try.\n"
-            "3. Suggest a bash command or code snippet as a tool-call if appropriate."
-        )
-        
-        try:
-            # Use CLI brain for error analysis (Gemini Pro)
-            response = await self.cli_brain.respond(error_prompt, self)
-            if response:
-                self._emit_chat("Shimeji", f"🚨 Error Detected!\n\n{response}")
-                self._emit_bubble("Shimeji", "I saw an error! Check chat for help.", duration=10)
-                # Transition to Alert state
-                self._transition_mascot_state("Alert")
-        except Exception as exc:
-            LOGGER.error("Error resolution failed: %s", exc)
     
     def _transition_mascot_state(self, state_name: str) -> None:
         """Transition mascot state machine to a new state.
@@ -1029,23 +906,10 @@ class DualModeAgent:
                 continue
 
             context_snapshot = await self._get_context_snapshot()
-            working_summary = self.memory.recent_observations()
-            episodic_summary = await self.memory.recall_relevant_async(context_snapshot)
-            self.emotions.natural_decay()
-            
-            # Record decision time
-            decision_start = time.monotonic()
-            decision = await self.proactive_brain.decide(
-                context_snapshot,
-                self._recent_actions,
-                working_summary,
-                episodic_summary,
-                self.emotions.snapshot(),
+            _, interval = await self.core.proactive_cycle(
+                context_snapshot=context_snapshot,
+                recent_actions=self._recent_actions,
             )
-            decision_duration = time.monotonic() - decision_start
-            self._metrics.record_decision(decision_duration)
-            
-            interval = await self._execute_decision(decision, context_snapshot)
 
     async def _anchor_loop(self) -> None:
         last_anchor: Optional[Tuple[float, float]] = None
@@ -1104,35 +968,22 @@ class DualModeAgent:
         except asyncio.CancelledError:
             raise
 
-    async def _execute_decision(self, decision: ProactiveDecision, context_snapshot: Dict[str, Any]) -> int:
-        """Execute a decision using the decision executor."""
-        # Publish decision made event for state machine
-        self._event_bus.publish(EventType.DECISION_MADE, {"action": decision.action})
-        # Transition to ExecutingTask state
-        self._transition_mascot_state("ExecutingTask")
-        
-        result = await self._decision_executor.execute(decision, context_snapshot)
-        
-        # Return to Idle after execution
-        self._transition_mascot_state("Idle")
-        return result
-
     # ------------------------------------------------------------------
     async def handle_cli_request(self, prompt: str) -> str:
         async with self._mode_lock:
             LOGGER.info("Switching to CLI mode for prompt: %s", prompt)
             await self._switch_mode(AgentMode.CLI)
             try:
-                response = await self.cli_brain.respond(prompt, self)
-                # Add emojis to response
-                response = self.core.add_emojis(response)
-                self._emit_chat("Shimeji", response)
-                self._emit_bubble("Shimeji", response, duration=8)
-                summary = response.splitlines()[0] if response else "(no response)"
-                self.avatar_client.queue_dialogue(summary[:240], duration=12)
-                self._dispatch_dialogue()
-                if response:
-                    self._emit_chat("Gemini", response)
+                def _enqueue_dialogue(resp: str) -> None:
+                    summary = resp.splitlines()[0] if resp else "(no response)"
+                    self.avatar_client.queue_dialogue(summary[:240], duration=12)
+                    self._dispatch_dialogue()
+
+                response = await self.core.handle_cli_request(
+                    prompt,
+                    self,
+                    enqueue_dialogue=_enqueue_dialogue,
+                )
             finally:
                 await self._switch_mode(AgentMode.PROACTIVE)
         return response
@@ -1157,14 +1008,15 @@ class DualModeAgent:
             self._emit_chat("Gemini", "Your message appears to be empty or invalid after processing.")
             return
 
-        if self._loop is None:
+        loop = self._loop
+        if loop is None:
             self._emit_chat("Gemini", "I'm not ready yet—try again in a moment.")
             return
 
         def _dispatch(p: str) -> None:
-            asyncio.create_task(self._process_cli_prompt(p))
+            loop.create_task(self._process_cli_prompt(p))
 
-        self._loop.call_soon_threadsafe(_dispatch, sanitized_prompt)
+        loop.call_soon_threadsafe(_dispatch, sanitized_prompt)
 
     async def _process_cli_prompt(self, prompt: str) -> None:
         await self.core.process_cli_prompt(self, prompt)

@@ -129,7 +129,7 @@ class CLIBrain:
                         LOGGER.info("[CLIBrain] Executing function: %s(%s)", fc.name, fc.args)
                         
                         # Execute the function and capture result for chaining
-                        # For execute_bash, execute directly and capture output (skip _execute_decision to avoid duplicate chat messages)
+                        # For execute_bash, execute directly and capture output (skip execute_decision to avoid duplicate chat messages)
                         if fc.name == "execute_bash":
                             command = dict(fc.args).get("command", "")
                             from modules.productivity_tools import ProductivityTools
@@ -167,7 +167,7 @@ class CLIBrain:
                             # For other functions, execute via agent (they handle their own display)
                             decision = ProactiveDecision(fc.name, dict(fc.args))
                             context_snapshot = await agent.get_latest_context()
-                            await agent._execute_decision(decision, context_snapshot)
+                            await agent.core.execute_decision(decision, context_snapshot)
                             
                             # Create generic response for chaining
                             function_response_parts.append({

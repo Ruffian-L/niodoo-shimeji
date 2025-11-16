@@ -27,6 +27,8 @@ from modules.permission_manager import PermissionScope, PermissionStatus
 from modules.presentation_api import UIEvent
 from modules.system_monitor import SystemAlert
 from modules.event_bus import EventType
+from modules.file_handler import FileHandler
+from modules.input_sanitizer import InputSanitizer
 
 LOGGER = logging.getLogger(__name__)
 
@@ -90,6 +92,7 @@ class AgentCore:
             "full text of the error. Respond with JSON: "
             "{'app': '...', 'task': '...', 'file': '...', 'error_text': '...'}"
         )
+        self._file_handler = FileHandler(self)
 
     async def process_cli_prompt(self, agent: "DualModeAgent", prompt: str) -> None:
         """Process a CLI prompt, including vision and chat updates."""
@@ -159,6 +162,24 @@ class AgentCore:
         enqueue_dialogue(response)
         self._emit_chat("Gemini", response)
         return response
+
+    def sanitize_cli_prompt(self, prompt: str) -> Optional[str]:
+        """Normalize a CLI prompt or return ``None`` if it collapses to empty."""
+
+        if not prompt:
+            return None
+        sanitized = InputSanitizer.sanitize_prompt(prompt)
+        return sanitized or None
+
+    def update_file_handler_context(
+        self,
+        latest_context: Dict[str, Any],
+        recent_actions: Deque[str],
+    ) -> None:
+        self._file_handler.set_context(latest_context, recent_actions)
+
+    async def handle_file_drop(self, data: Any) -> None:
+        await self._file_handler.handle_file_drop(data)
 
     async def compute_proactive_decision(
         self,

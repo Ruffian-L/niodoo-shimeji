@@ -65,7 +65,6 @@ from modules.metrics import PerformanceMetrics
 from modules.invocation_server import InvocationServer
 from modules.context_manager import ContextManager
 from modules.dialogue_manager import DialogueManager
-from modules.file_handler import FileHandler
 from modules.input_sanitizer import InputSanitizer
 from modules.presentation_api import ShijimaAvatarClient, SpeechBubbleUISink, UIEvent
 from modules.agent_core import AgentCore
@@ -356,10 +355,7 @@ class DualModeAgent:
             self.desktop_controller,
             self.ui_event_sink,
         )
-        # Ensure recent actions deque exists before passing it to the file handler
-        # (the file handler expects a list of recent actions; if this is not
-        # yet initialized an AttributeError will be raised). Initialize here so
-        # it's available to other components at startup.
+        # Ensure recent actions deque exists before wiring dependent components.
         self._recent_actions: Deque[str] = deque(maxlen=20)
 
         self.mode = AgentMode.PROACTIVE
@@ -411,9 +407,8 @@ class DualModeAgent:
             event_bus=self._event_bus,
             decision_executor=self._decision_executor,
         )
+        self.core.update_file_handler_context(self._latest_context, self._recent_actions)
 
-        self._file_handler = FileHandler(self.proactive_brain, self.memory, self.emotions, self.core.execute_decision)
-        self._file_handler.set_context(self._latest_context, list(self._recent_actions))
         
         # Initialize hybrid privacy filter with process pool
         try:
@@ -854,12 +849,12 @@ class DualModeAgent:
             return
 
         # Update file handler context
-        self._file_handler.set_context(self._latest_context, list(self._recent_actions))
+        self.core.update_file_handler_context(self._latest_context, self._recent_actions)
 
         # Route to proactive agent if idle, or reactive agent if chat active
         if self.mode == AgentMode.PROACTIVE:
             # Trigger proactive analysis
-            asyncio.create_task(self._file_handler.handle_file_drop(data))
+            asyncio.create_task(self.core.handle_file_drop(data))
         else:
             # In CLI mode, file is already handled by chat window
             LOGGER.debug("File dropped in CLI mode; handled by chat window")
@@ -1002,8 +997,7 @@ class DualModeAgent:
         if not prompt:
             return
 
-        # Sanitize the prompt
-        sanitized_prompt = InputSanitizer.sanitize_prompt(prompt)
+        sanitized_prompt = self.core.sanitize_cli_prompt(prompt)
         if not sanitized_prompt:
             self._emit_chat("Gemini", "Your message appears to be empty or invalid after processing.")
             return

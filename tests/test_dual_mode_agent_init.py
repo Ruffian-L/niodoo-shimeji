@@ -25,6 +25,6 @@ def test_dual_mode_agent_initializes_overlay_and_dialogue_manager():
         assert hasattr(agent, "_dialogue_manager")
         assert agent._dialogue_manager.ui_event_sink is agent.ui_event_sink
 
-        # Recent actions should be initialized before file handler context is set
+        # Recent actions should be initialized before AgentCore wiring uses them
         assert hasattr(agent, "_recent_actions")
         assert isinstance(agent._recent_actions, list) or hasattr(agent._recent_actions, "append")

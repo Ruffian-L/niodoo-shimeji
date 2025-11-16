@@ -74,7 +74,11 @@ class InvocationServer:
                     response = {"error": "prompt required"}
                 else:
                     # Sanitize the prompt
-                    prompt = InputSanitizer.sanitize_prompt(raw_prompt)
+                    core = getattr(self._agent, "core", None)
+                    if core:
+                        prompt = core.sanitize_cli_prompt(raw_prompt)
+                    else:
+                        prompt = InputSanitizer.sanitize_prompt(raw_prompt)
                     if not prompt:
                         response = {"error": "prompt is empty after sanitization"}
                     else:

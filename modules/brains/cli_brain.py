@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import google.generativeai as genai
 
 from modules.brains.shared import ProactiveDecision, RateLimiter
+from modules.presentation_api import UIEvent
 
 if TYPE_CHECKING:
     from shimeji_dual_mode_agent import DualModeAgent
@@ -145,7 +146,12 @@ class CLIBrain:
                             
                             # Show in chat for user visibility (only once, not duplicated)
                             display_output = output or error or "No output"
-                            agent.overlay.show_chat_message("Shimeji", f"Command: `{command}`\n\nOutput:\n```\n{display_output[:1000]}\n```")
+                            ui_sink = getattr(agent, "ui_event_sink", None)
+                            if ui_sink:
+                                ui_sink.emit(UIEvent("chat_message", {
+                                    "author": "Shimeji",
+                                    "text": f"Command: `{command}`\n\nOutput:\n```\n{display_output[:1000]}\n```",
+                                }))
                             
                             function_response_parts.append({
                                 "function_call": {

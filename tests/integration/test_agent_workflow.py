@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import sys
 from pathlib import Path
@@ -12,7 +12,8 @@ from pathlib import Path
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from modules.brains.shared import ProactiveDecision
+from tests.fixtures.dbus_stub import mock_pydbus
+from tests.fixtures.google_stub import mock_google_generativeai
 from tests.fixtures.mock_gemini import MockGenerativeModel
 
 
@@ -21,7 +22,7 @@ async def test_proactive_to_cli_switch():
     """Test switching from proactive to CLI mode."""
     from shimeji_dual_mode_agent import DualModeAgent, AgentMode
     
-    with patch('google.generativeai.GenerativeModel', MockGenerativeModel):
+    with mock_google_generativeai(MockGenerativeModel), mock_pydbus():
         agent = DualModeAgent(
             flash_model="gemini-2.5-flash",
             pro_model="gemini-2.5-pro",
@@ -35,6 +36,10 @@ async def test_proactive_to_cli_switch():
         agent.overlay.stop = MagicMock()
         agent.overlay.open_chat_panel = MagicMock()
         agent.overlay.update_anchor = MagicMock()
+        agent.ui_event_sink._overlay = agent.overlay
+        agent.ui_event_sink.emit = MagicMock()
+        agent.ui_event_sink.set_prompt_sender(agent._submit_cli_prompt)
+        agent.ui_event_sink.set_agent_reference(agent)
         
         # Mock desktop controller
         agent.desktop_controller = MagicMock()
@@ -73,7 +78,9 @@ async def test_decision_execution():
     """Test decision execution."""
     from shimeji_dual_mode_agent import DualModeAgent
     
-    with patch('google.generativeai.GenerativeModel', MockGenerativeModel):
+    with mock_google_generativeai(MockGenerativeModel), mock_pydbus():
+        from modules.brains.shared import ProactiveDecision
+
         agent = DualModeAgent(
             flash_model="gemini-2.5-flash",
             pro_model="gemini-2.5-pro",
@@ -83,6 +90,10 @@ async def test_decision_execution():
         agent.overlay = MagicMock()
         agent.overlay.show_chat_message = MagicMock()
         agent.overlay.show_bubble_message = MagicMock()
+        agent.ui_event_sink._overlay = agent.overlay
+        agent.ui_event_sink.emit = MagicMock()
+        agent.ui_event_sink.set_prompt_sender(agent._submit_cli_prompt)
+        agent.ui_event_sink.set_agent_reference(agent)
         agent.desktop_controller = MagicMock()
         agent.desktop_controller.ensure_mascot = MagicMock(return_value=1)
         agent.desktop_controller.set_behavior = MagicMock(return_value=True)

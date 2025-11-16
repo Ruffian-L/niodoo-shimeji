@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from inspect import isawaitable
 from typing import Any, Optional
 
 from modules.emotion_model import EmotionModel
@@ -9,6 +10,13 @@ from modules.input_sanitizer import InputSanitizer
 from modules.memory_manager import MemoryManager
 
 LOGGER = logging.getLogger(__name__)
+
+
+async def _maybe_await(value: Any) -> Any:
+    """Return awaited value when coroutine-like, otherwise passthrough."""
+    if isawaitable(value):
+        return await value
+    return value
 
 
 class FileHandler:
@@ -64,14 +72,16 @@ class FileHandler:
                 "(e.g., 'Summarize', 'Rename based on content', 'Move to /Documents/Reports')."
             )
             try:
-                decision = await self.proactive_brain.decide(
-                    self._latest_context,
-                    self._recent_actions,
-                    self.memory.recent_observations(),
-                    await self.memory.recall_relevant_async(self._latest_context),
-                    self.emotions.snapshot(),
+                decision = await _maybe_await(
+                    self.proactive_brain.decide(
+                        self._latest_context,
+                        self._recent_actions,
+                        self.memory.recent_observations(),
+                        await _maybe_await(self.memory.recall_relevant_async(self._latest_context)),
+                        self.emotions.snapshot(),
+                    )
                 )
-                await self._execute_decision(decision, self._latest_context)
+                await _maybe_await(self._execute_decision(decision, self._latest_context))
             except Exception as exc:
                 LOGGER.error("Proactive file analysis failed: %s", exc)
         elif text:
@@ -84,13 +94,15 @@ class FileHandler:
             # Analyze text snippet
             prompt = f"The user dropped this text: {sanitized_text}\nWhat should I do with it?"
             try:
-                decision = await self.proactive_brain.decide(
-                    self._latest_context,
-                    self._recent_actions,
-                    self.memory.recent_observations(),
-                    await self.memory.recall_relevant_async(self._latest_context),
-                    self.emotions.snapshot(),
+                decision = await _maybe_await(
+                    self.proactive_brain.decide(
+                        self._latest_context,
+                        self._recent_actions,
+                        self.memory.recent_observations(),
+                        await _maybe_await(self.memory.recall_relevant_async(self._latest_context)),
+                        self.emotions.snapshot(),
+                    )
                 )
-                await self._execute_decision(decision, self._latest_context)
+                await _maybe_await(self._execute_decision(decision, self._latest_context))
             except Exception as exc:
                 LOGGER.error("Proactive text analysis failed: %s", exc)

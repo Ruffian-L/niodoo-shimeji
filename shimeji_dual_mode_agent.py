@@ -67,8 +67,9 @@ from modules.invocation_server import InvocationServer
 from modules.context_manager import ContextManager
 from modules.dialogue_manager import DialogueManager
 from modules.file_handler import FileHandler
-from modules.genai_utils import get_cached_model
 from modules.input_sanitizer import InputSanitizer
+from modules.presentation_api import ShijimaAvatarClient, SpeechBubbleUISink, UIEvent
+from modules.agent_core import AgentCore
 
 LOGGER = logging.getLogger(__name__)
 
@@ -276,6 +277,9 @@ class DualModeAgent:
         listen_host: str = DEFAULT_LISTEN_HOST,
         listen_port: int = DEFAULT_LISTEN_PORT,
     ) -> None:
+        # LAP NOTE: Everything in __init__ currently mixes "Runner" (process/
+        # overlay wiring) and "Brain" (cognitive pipelines). These markers make
+        # it easier to peel AgentCore out without losing track of deps.
         self.privacy_filter = PrivacyFilter()
         # Initialize hybrid privacy filter (will be set after process pool is created)
         self._hybrid_privacy_filter: Optional[Any] = None
@@ -292,7 +296,10 @@ class DualModeAgent:
 
         self.desktop_controller = DesktopController()
         self.desktop_controller.set_allowed_behaviours(behaviour_names)
+        self.avatar_client = ShijimaAvatarClient(self.desktop_controller)
         
+        # Runner responsibility: load config + infra knobs.
+        # TODO(LAP-Phase1): Move Gemini plumbing into ModelBackend + AgentCore.
         # Create rate limiter if configured
         rate_limiter = None
         try:
@@ -302,6 +309,7 @@ class DualModeAgent:
         except (ValueError, TypeError):
             pass
         
+        # LAP Brain: actual reasoning stack (to migrate under AgentCore).
         self.proactive_brain = ProactiveBrain(
             flash_model,
             system_prompt=self._build_proactive_prompt(personality),
@@ -335,12 +343,20 @@ class DualModeAgent:
         self._metrics = PerformanceMetrics()
 
         # Create managers
+        # TODO(LAP-Phase1): keep ContextManager/Memory/Events inside AgentCore.
         self._context_manager = ContextManager(self.privacy_filter, self.memory, self._event_bus, self._metrics)
         # Initialize overlay before creating the dialogue manager so the
         # manager always receives a valid overlay reference. This avoids an
         # AttributeError when `DialogueManager` tries to access `overlay`.
         self.overlay = SpeechBubbleOverlay(memory_manager=self.memory)
-        self._dialogue_manager = DialogueManager(self.desktop_controller, self.overlay)
+        self.ui_event_sink = SpeechBubbleUISink(self.overlay)
+        self.ui_event_sink.set_prompt_sender(self._submit_cli_prompt)
+        self.ui_event_sink.set_agent_reference(self)
+        # LAP Runner: UI wiring. Future clients (Flutter) plug in via UIEventSink.
+        self._dialogue_manager = DialogueManager(
+            self.desktop_controller,
+            self.ui_event_sink,
+        )
         self._file_handler = FileHandler(self.proactive_brain, self.memory, self.emotions, self._execute_decision)
 
         # Ensure recent actions deque exists before passing it to the file handler
@@ -360,9 +376,6 @@ class DualModeAgent:
         self._running = False
         self._proactive_task: Optional[asyncio.Task[None]] = None
         self._invocation_server = InvocationServer(self, listen_host, listen_port)
-        # Configure overlay callbacks and references
-        self.overlay.set_prompt_sender(self._submit_cli_prompt)
-        self.overlay._agent_ref = self  # Store agent reference for event bus access (P2.4)
         self._greeting_shown = False  # Flag to prevent duplicate greetings
         try:
             self._anchor_poll_interval = max(
@@ -382,6 +395,14 @@ class DualModeAgent:
         # This must use 'spawn' method (set in main()) to avoid asyncio event loop conflicts on Linux
         max_workers = int(os.getenv("PROCESS_POOL_WORKERS", "2"))
         self._process_pool: Optional[ProcessPoolExecutor] = ProcessPoolExecutor(max_workers=max_workers)
+
+        # AgentCore already hosts a subset of the brain; expanding soon.
+        self.core = AgentCore(
+            cli_brain=self.cli_brain,
+            avatar_client=self.avatar_client,
+            ui_event_sink=self.ui_event_sink,
+            process_pool=self._process_pool,
+        )
         
         # Initialize hybrid privacy filter with process pool
         try:
@@ -470,9 +491,10 @@ class DualModeAgent:
 
         self._context_manager.start(self._loop)
 
-        self.overlay.start()
-        self.overlay.update_anchor(None, None)
-        self.overlay.open_chat_panel()
+        # LAP Runner boot sequence (UI/mascot lifecycle management).
+        self.ui_event_sink.start()
+        self._emit_anchor_update(None)
+        self.ui_event_sink.emit(UIEvent("open_chat"))
 
         mascot_ready = await asyncio.to_thread(
             self.desktop_controller.wait_for_mascot,
@@ -481,9 +503,14 @@ class DualModeAgent:
         )
         if not mascot_ready:
             LOGGER.warning("No active Shijima mascots detected; proactive actions will be deferred until one appears.")
-            self.overlay.show_chat_message(
-                "Gemini",
-                "I can't see a mascot yet. Once you spawn or select one I'll start moving!",
+            self.ui_event_sink.emit(
+                UIEvent(
+                    "chat_message",
+                    {
+                        "author": "Gemini",
+                        "text": "I can't see a mascot yet. Once you spawn or select one I'll start moving!",
+                    },
+                )
             )
         else:
             # Single greeting message - shown in both bubble and chat panel
@@ -497,7 +524,7 @@ class DualModeAgent:
                     "• I can analyze screenshots, monitor system status, and more!\n\n"
                     "Just type in the chat or click me to get started!"
                 )
-                self.desktop_controller.show_dialogue(
+                self.avatar_client.queue_dialogue(
                     greeting_text,
                     duration=12,
                     author="Shimeji",
@@ -507,7 +534,7 @@ class DualModeAgent:
                 self._dispatch_dialogue()
             anchor_initial = await asyncio.to_thread(self.desktop_controller.get_primary_mascot_anchor)
             if anchor_initial:
-                self.overlay.update_anchor(*anchor_initial)
+                self._emit_anchor_update(anchor_initial)
 
         await self._invocation_server.start()
         self._anchor_task = asyncio.create_task(self._anchor_loop())
@@ -584,7 +611,7 @@ class DualModeAgent:
         if hasattr(self, '_permission_manager') and self._permission_manager:
             self._permission_manager.close()
         self.memory.close()
-        self.overlay.stop()
+        self.ui_event_sink.stop()
         LOGGER.info("DualModeAgent stopped")
 
     # ------------------------------------------------------------------
@@ -783,11 +810,8 @@ class DualModeAgent:
         
         message = f"{prefix}{alert.message}"
         
-        # Show in speech bubble
-        self.overlay.show_chat_message(author, message)
-        
-        # Also show in chat panel for persistence
-        # (overlay.show_chat_message already handles this)
+        # Show in UI via event sink
+        self._emit_chat(author, message)
     
     def _on_decision_made(self, data: Any) -> None:
         """Handle decision made event - transition to Pondering state."""
@@ -807,20 +831,46 @@ class DualModeAgent:
             return
         
         event_type = data.get("type")
-        
         if event_type == "media_playing":
-            # Media is playing - could affect emotion model
             player = data.get("player", "unknown")
             metadata = data.get("metadata", {})
             LOGGER.debug("Media playing: %s - %s", player, metadata.get("xesam:title", "Unknown"))
             # Could update emotion model based on music
         elif event_type == "notification":
-            # Desktop notification received
             app_name = data.get("app_name", "unknown")
             summary = data.get("summary", "")
             body = data.get("body", "")
             LOGGER.debug("Notification from %s: %s - %s", app_name, summary, body)
             # Could intercept notifications based on context (e.g., during Zoom calls)
+
+    def _emit_chat(self, author: str, text: str) -> None:
+        if not text:
+            return
+        sink = getattr(self, "ui_event_sink", None)
+        if not sink:
+            LOGGER.warning("UI event sink unavailable; dropping chat message from %s", author)
+            return
+        sink.emit(UIEvent("chat_message", {"author": author, "text": text}))
+
+    def _emit_bubble(self, author: str, text: str, *, duration: int = 6) -> None:
+        if not text:
+            return
+        payload = {"author": author, "text": text, "duration": int(max(1, duration))}
+        sink = getattr(self, "ui_event_sink", None)
+        if not sink:
+            LOGGER.warning("UI event sink unavailable; dropping bubble message from %s", author)
+            return
+        sink.emit(UIEvent("bubble_message", payload))
+
+    def _emit_anchor_update(self, anchor: Optional[Tuple[float, float]]) -> None:
+        sink = getattr(self, "ui_event_sink", None)
+        if not sink:
+            LOGGER.warning("UI event sink unavailable; cannot update anchor")
+            return
+        payload = {"x": None, "y": None}
+        if anchor:
+            payload["x"], payload["y"] = anchor
+        sink.emit(UIEvent("update_anchor", payload))
     
     def _on_file_dropped(self, data: Any) -> None:
         """Handle file drop event (P2.4).
@@ -933,8 +983,8 @@ class DualModeAgent:
             # Use CLI brain for error analysis (Gemini Pro)
             response = await self.cli_brain.respond(error_prompt, self)
             if response:
-                self.overlay.show_chat_message("Shimeji", f"🚨 Error Detected!\n\n{response}")
-                self.overlay.show_bubble_message("Shimeji", "I saw an error! Check chat for help.", duration=10)
+                self._emit_chat("Shimeji", f"🚨 Error Detected!\n\n{response}")
+                self._emit_bubble("Shimeji", "I saw an error! Check chat for help.", duration=10)
                 # Transition to Alert state
                 self._transition_mascot_state("Alert")
         except Exception as exc:
@@ -1036,16 +1086,16 @@ class DualModeAgent:
 
                 if anchor != last_anchor:
                     if anchor:
-                        self.overlay.update_anchor(*anchor)
+                        self._emit_anchor_update(anchor)
                     else:
-                        self.overlay.update_anchor(None, None)
+                        self._emit_anchor_update(None)
                     last_anchor = anchor
                 
                 # React to state changes with personality
                 if current_behavior != last_behavior and current_behavior:
                     reaction = self._get_state_reaction(current_behavior, last_behavior)
                     if reaction:
-                        self.overlay.show_bubble_message("Shimeji", reaction, duration=3)
+                        self._emit_bubble("Shimeji", reaction, duration=3)
                         LOGGER.info("State reaction: %s -> %s: %s", last_behavior, current_behavior, reaction)
                     last_behavior = current_behavior
 
@@ -1075,14 +1125,14 @@ class DualModeAgent:
             try:
                 response = await self.cli_brain.respond(prompt, self)
                 # Add emojis to response
-                response = self._add_emojis(response)
-                self.overlay.show_chat_message("Shimeji", response)
-                self.overlay.show_bubble_message("Shimeji", response, duration=8)
+                response = self.core.add_emojis(response)
+                self._emit_chat("Shimeji", response)
+                self._emit_bubble("Shimeji", response, duration=8)
                 summary = response.splitlines()[0] if response else "(no response)"
-                self.desktop_controller.show_dialogue(summary[:240], duration=12)
+                self.avatar_client.queue_dialogue(summary[:240], duration=12)
                 self._dispatch_dialogue()
                 if response:
-                    self.overlay.show_chat_message("Gemini", response)
+                    self._emit_chat("Gemini", response)
             finally:
                 await self._switch_mode(AgentMode.PROACTIVE)
         return response
@@ -1104,11 +1154,11 @@ class DualModeAgent:
         # Sanitize the prompt
         sanitized_prompt = InputSanitizer.sanitize_prompt(prompt)
         if not sanitized_prompt:
-            self.overlay.show_chat_message("Gemini", "Your message appears to be empty or invalid after processing.")
+            self._emit_chat("Gemini", "Your message appears to be empty or invalid after processing.")
             return
 
         if self._loop is None:
-            self.overlay.show_chat_message("Gemini", "I'm not ready yet—try again in a moment.")
+            self._emit_chat("Gemini", "I'm not ready yet—try again in a moment.")
             return
 
         def _dispatch(p: str) -> None:
@@ -1117,193 +1167,9 @@ class DualModeAgent:
         self._loop.call_soon_threadsafe(_dispatch, sanitized_prompt)
 
     async def _process_cli_prompt(self, prompt: str) -> None:
-        # Check if this is an image analysis request
-        if prompt.startswith("[IMAGE_ANALYZE:"):
-            # Extract image path and question
-            import re
-            match = re.match(r'\[IMAGE_ANALYZE:(.+?)\]\s*(.*)', prompt)
-            if match:
-                image_path = match.group(1)
-                question = match.group(2) or "What do you see in this image? Describe it in detail."
-                # Show typing indicator
-                if hasattr(self.overlay, '_chat_window') and self.overlay._chat_window:
-                    self.overlay._chat_window.show_typing()
-                try:
-                    analysis = await self._analyze_image_with_vision(image_path, question)
-                    if hasattr(self.overlay, '_chat_window') and self.overlay._chat_window:
-                        self.overlay._chat_window.hide_typing()
-                    if analysis:
-                        self.overlay.show_chat_message("Shimeji", f"Image Analysis:\n{analysis}")
-                    else:
-                        self.overlay.show_chat_message("Shimeji", "Couldn't analyze image.")
-                except Exception as exc:
-                    LOGGER.exception("Image analysis failed: %s", exc)
-                    if hasattr(self.overlay, '_chat_window') and self.overlay._chat_window:
-                        self.overlay._chat_window.hide_typing()
-                    self.overlay.show_chat_message("Shimeji", f"Failed to analyze image: {exc}")
-                return
-        
-        # Show typing indicator
-        if hasattr(self.overlay, '_chat_window') and self.overlay._chat_window:
-            self.overlay._chat_window.show_typing()
-        
-        try:
-            response = await self.cli_brain.respond(prompt, self)
-            
-            # Hide typing indicator
-            if hasattr(self.overlay, '_chat_window') and self.overlay._chat_window:
-                self.overlay._chat_window.hide_typing()
-            
-            if response:  # Only show if there's actual text
-                response = self._add_emojis(response)
-                # Full response to panel (only once - no duplicates)
-                self.overlay.show_chat_message("Shimeji", response)
-                # Short version to bubble (only if response is short enough)
-                if len(response.split()) <= 30:
-                    self.overlay.show_bubble_message("Shimeji", response, duration=8)
-                else:
-                    # For long responses, just show a brief bubble
-                    short_response = ' '.join(response.split()[:15]) + '...'
-                    self.overlay.show_bubble_message("Shimeji", short_response, duration=5)
-        except (genai_types.BlockedPromptException, genai_types.StopCandidateException) as exc:
-            LOGGER.warning("Gemini API error: %s", exc)
-            if hasattr(self.overlay, '_chat_window') and self.overlay._chat_window:
-                self.overlay._chat_window.hide_typing()
-            self.overlay.show_chat_message("Shimeji", "Sorry, I can't process that request right now. Please try again.")
-        except Exception as exc:  # pragma: no cover - runtime dependent
-            LOGGER.exception("Unexpected error in CLI prompt: %s", exc)
-            if hasattr(self.overlay, '_chat_window') and self.overlay._chat_window:
-                self.overlay._chat_window.hide_typing()
-            self.overlay.show_chat_message("Shimeji", f"Oops! Something went wrong: {exc}")
+        await self.core.process_cli_prompt(self, prompt)
 
-    async def _analyze_image_with_vision(self, image_path: str, question: str) -> Optional[str]:
-        """Analyze an image using Gemini Vision API."""
-        if not os.path.exists(image_path):
-            LOGGER.warning("Screenshot file not found: %s", image_path)
-            return None
-        
-        loop = asyncio.get_running_loop()
-        vision_model = get_cached_model(DEFAULT_PRO_MODEL)
-        
-        # Use process pool for blocking operations to avoid freezing UI
-        executor = self._process_pool if self._process_pool else None
-        
-        try:
-            # Try direct file path first (most efficient)
-            response = await loop.run_in_executor(
-                executor, 
-                lambda: vision_model.generate_content([image_path, question])
-            )
-            return self._extract_text_from_response(response)
-        except Exception as exc:
-            LOGGER.debug("Direct file path failed, trying PIL: %s", exc)
-            return await self._analyze_with_pil_fallback(image_path, question, vision_model, loop)
-
-    async def _analyze_with_pil_fallback(self, image_path: str, question: str, 
-                                         model, loop) -> Optional[str]:
-        """Fallback using PIL Image."""
-        try:
-            import PIL.Image
-            
-            # Define function outside lambda for multiprocessing compatibility
-            def _generate_content(img_path: str, q: str, m) -> Any:
-                img = PIL.Image.open(img_path)
-                return m.generate_content([img, q])
-            
-            # Use process pool for blocking operations
-            executor = self._process_pool if self._process_pool else None
-            response = await loop.run_in_executor(
-                executor,
-                _generate_content,
-                image_path,
-                question,
-                model
-            )
-            return self._extract_text_from_response(response)
-        except ImportError:
-            LOGGER.warning("PIL not available, trying file upload")
-            return await self._analyze_with_upload_fallback(image_path, question, model, loop)
-        except Exception as exc:
-            LOGGER.error("PIL fallback failed: %s", exc)
-            return None
-
-    async def _analyze_with_upload_fallback(self, image_path: str, question: str, 
-                                            model, loop) -> Optional[str]:
-        """Last resort: upload file to Gemini."""
-        uploaded_file = None
-        try:
-            # Define functions outside lambda for multiprocessing compatibility
-            def _upload_file(path: str) -> Any:
-                return genai.upload_file(path=path)
-            
-            def _generate_with_upload(uf, q: str, m) -> Any:
-                return m.generate_content([uf, q])
-            
-            # Use process pool for blocking file operations
-            executor = self._process_pool if self._process_pool else None
-            uploaded_file = await loop.run_in_executor(
-                executor,
-                _upload_file,
-                image_path
-            )
-            response = await loop.run_in_executor(
-                executor,
-                _generate_with_upload,
-                uploaded_file,
-                question,
-                model
-            )
-            return self._extract_text_from_response(response)
-        except Exception as exc:
-            LOGGER.error("Upload fallback failed: %s", exc)
-            return None
-        finally:
-            if uploaded_file:
-                try:
-                    def _delete_file(name: str) -> None:
-                        genai.delete_file(name)
-                    
-                    executor = self._process_pool if self._process_pool else None
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
-                        executor,
-                        _delete_file,
-                        uploaded_file.name
-                    )
-                except Exception as cleanup_exc:
-                    LOGGER.warning("Failed to cleanup uploaded file: %s", cleanup_exc)
-
-    def _extract_text_from_response(self, response) -> Optional[str]:
-        """Extract text from Gemini response."""
-        text_parts = []
-        for candidate in response.candidates:
-            for part in candidate.content.parts:
-                if hasattr(part, 'text') and part.text:
-                    text_parts.append(part.text)
-        return ' '.join(text_parts) if text_parts else None
-
-    def _get_random_fact(self, topic: Optional[str] = None) -> str:
-        """Get a random fact, with optional topic."""
-        try:
-            import wikipediaapi
-        except ImportError:
-            return "Did you know? The universe is expanding faster than expected!"
-        
-        wiki = wikipediaapi.Wikipedia('en')
-        if topic:
-            page = wiki.page(topic)
-            if page.exists():
-                return random.choice(page.summary.split('. ')) + '.'
-        # Fallback random
-        return "Did you know? The universe is expanding faster than expected!"
-
-    def _add_emojis(self, text: str) -> str:
-        # Minimal emoji - only at end of sentences
-        if text.endswith("!"):
-            return text[:-1] + "! 😎"
-        elif text.endswith("?"):
-            return text[:-1] + "? 🤔"
-        return text
+    # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
     @staticmethod

@@ -1,5 +1,19 @@
 # Changelog
 
+## 2025-01-15 - USB-C Monitor Troubleshooting
+
+### USB-C to HDMI Display Issue Diagnosis
+- **Created troubleshooting script**: `/tmp/fix_usbc_monitor.sh` for diagnosing USB-C to HDMI adapter issues
+- **Identified root cause**: USB-C adapter detected but not negotiating DisplayPort Alt Mode (kernel error: `UCSI_GET_PDOS failed (-95)`)
+- **Diagnosis findings**: Adapter appears as "Billboard" device instead of DisplayPort device, indicating failed mode negotiation
+- **Hardware topology discovered**: USB-C ports are connected to AMD USB4 controller (card2/amdgpu), not NVIDIA GPU (card1/nvidia)
+- **NVIDIA status**: NVIDIA GPU is active (prime-select: nvidia) but shows 0 display devices - USB-C ports physically connected to AMD side
+- **Error code -95 (EOPNOTSUPP)**: USB-C controller firmware/hardware cannot negotiate DisplayPort Alt Mode - likely hardware/firmware limitation or adapter incompatibility
+- **Web research findings**: Confirmed this is a known issue with AMD USB4 controllers, some adapters appear as "Billboard" devices, BIOS/firmware updates may help, connection order critical (monitor ON → HDMI → USB-C), kernel 6.5.5+ may have regressions
+- **Created comprehensive fix guides**: `/tmp/usbc_monitor_fix_guide.txt` and `/tmp/ALL_USBC_SOLUTIONS.txt` with step-by-step solutions including connection order, firmware updates, adapter compatibility checks, UCSI driver reload procedure, kernel parameter workarounds (blacklist ucsi_acpi), and workarounds
+- **Advanced solutions documented**: UCSI driver reload script (`/tmp/try_ucsi_reload.sh`), kernel version downgrade options, BIOS settings check, firmware update procedures
+- **Troubleshooting steps documented**: Unplug/replug sequence, port compatibility check, display manager restart options, BIOS/UEFI USB-C DisplayPort settings check, system/kernel updates
+
 ## 2025-01-15 - Zombie Process Cleanup & Prevention
 
 ### Zombie Process Detection & Cleanup

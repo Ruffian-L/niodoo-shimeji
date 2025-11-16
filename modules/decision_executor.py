@@ -13,6 +13,7 @@ from modules.brains.shared import ProactiveDecision
 from modules.productivity_tools import ProductivityTools
 from modules.tool_schema_factory import get_registered_plugins
 from modules.permission_manager import PermissionManager, PermissionScope, PermissionStatus
+from modules.presentation_api import UIEvent
 
 if TYPE_CHECKING:
     from shimeji_dual_mode_agent import DualModeAgent
@@ -64,6 +65,27 @@ class DecisionExecutor:
             "share_knowledge": self._handle_share_knowledge,
             "request_permission": self._handle_request_permission,
         }
+
+    def _emit_chat(self, author: str, text: str) -> None:
+        if not text:
+            return
+        self.agent.ui_event_sink.emit(UIEvent("chat_message", {"author": author, "text": text}))
+
+    def _emit_bubble(self, author: str, text: str, *, duration: int = 6) -> None:
+        if not text:
+            return
+        self.agent.ui_event_sink.emit(
+            UIEvent("bubble_message", {"author": author, "text": text, "duration": duration})
+        )
+
+    def _emit_permission_request(self, agent_id: str, scope: PermissionScope, action: str, args: Dict[str, Any]) -> None:
+        payload = {
+            "agent_id": agent_id,
+            "scope": scope.value,
+            "action": action,
+            "args": args,
+        }
+        self.agent.ui_event_sink.emit(UIEvent("permission_request", payload))
     
     async def execute(self, decision: ProactiveDecision, context_snapshot: Dict[str, Any]) -> int:
         """Execute a decision and return the next interval."""
@@ -84,11 +106,7 @@ class DecisionExecutor:
                 
                 if permission_status == PermissionStatus.DENY:
                     LOGGER.warning("Permission denied for %s.%s", agent_id, required_scope.value)
-                    self.agent.overlay.show_bubble_message(
-                        "Shimeji",
-                        f"Permission denied: {required_scope.value}",
-                        duration=5
-                    )
+                    self._emit_bubble("Shimeji", f"Permission denied: {required_scope.value}", duration=5)
                     return self.agent._reaction_interval
                 
                 if permission_status == PermissionStatus.ASK:
@@ -143,15 +161,14 @@ class DecisionExecutor:
         """
         # Publish permission request event
         from modules.event_bus import EventType
-        self.agent._event_bus.publish(
-            EventType.PERMISSION_REQUESTED,
-            {
-                "agent_id": agent_id,
-                "scope": scope.value,
-                "action": action,
-                "args": args,
-            }
-        )
+        payload = {
+            "agent_id": agent_id,
+            "scope": scope.value,
+            "action": action,
+            "args": args,
+        }
+        self.agent._event_bus.publish(EventType.PERMISSION_REQUESTED, payload)
+        self._emit_permission_request(agent_id, scope, action, args)
         
         # Show permission request in chat UI
         scope_display = scope.value.replace("tool.", "").replace("context.", "").replace("_", " ").title()
@@ -162,8 +179,8 @@ class DecisionExecutor:
             f"Scope: {scope_display}\n\n"
             f"Allow this action? (Reply 'yes' to allow, 'no' to deny, or 'always' to always allow)"
         )
-        self.agent.overlay.show_chat_message("System", message)
-        self.agent.overlay.show_bubble_message("System", f"Permission needed: {scope_display}", duration=10)
+        self._emit_chat("System", message)
+        self._emit_bubble("System", f"Permission needed: {scope_display}", duration=10)
         
         # For now, default to asking (user can respond via chat)
         # In a full implementation, this would show a modal dialog and wait for response
@@ -192,7 +209,7 @@ class DecisionExecutor:
                 if behavior_messages:
                     message = random.choice(behavior_messages)
                     # Show in bubble only (not chat to reduce spam)
-                    self.agent.overlay.show_bubble_message("Shimeji", message, duration=4)
+                    self._emit_bubble("Shimeji", message, duration=4)
             
             # Publish behavior change event
             from modules.event_bus import EventType
@@ -290,7 +307,7 @@ class DecisionExecutor:
         text = args.get("text", "...")
         duration = int(args.get("duration_seconds", 6))
         # Only show in bubble, NOT in chat to reduce spam
-        self.agent.overlay.show_bubble_message("Shimeji", text, duration=duration)
+        self._emit_bubble("Shimeji", text, duration=duration)
         # Don't add to chat panel - too spammy
         self.agent.emotions.on_dialogue()
         return self.agent._reaction_interval
@@ -298,8 +315,8 @@ class DecisionExecutor:
     async def _handle_fetch_fact(self, args: Dict[str, Any], context: Dict[str, Any]) -> int:
         """Handle fetch_fact action."""
         topic = args.get("topic")
-        fact = self.agent._get_random_fact(topic)
-        self.agent.overlay.show_bubble_message("Shimeji", fact, duration=8)
+        fact = self.agent.core.get_random_fact(topic)
+        self._emit_bubble("Shimeji", fact, duration=8)
         return self.agent._reaction_interval
     
     async def _handle_execute_bash(self, args: Dict[str, Any], context: Dict[str, Any]) -> int:
@@ -308,7 +325,7 @@ class DecisionExecutor:
         if command:
             result = ProductivityTools.execute_bash_command(command)
             output = result.get("stdout", result.get("error", "No output"))
-            self.agent.overlay.show_chat_message("Shimeji", f"Command: `{command}`\n\nOutput:\n```\n{output[:1000]}\n```")
+            self._emit_chat("Shimeji", f"Command: `{command}`\n\nOutput:\n```\n{output[:1000]}\n```")
         return self.agent._reaction_interval
     
     async def _handle_check_system_status(self, args: Dict[str, Any], context: Dict[str, Any]) -> int:
@@ -326,13 +343,13 @@ class DecisionExecutor:
             status_parts.append(f"RAM: {memory['used_percent']}% used")
         
         status_msg = "\n".join(status_parts) if status_parts else "System status unavailable"
-        self.agent.overlay.show_chat_message("Shimeji", f"System Status:\n{status_msg}")
+        self._emit_chat("Shimeji", f"System Status:\n{status_msg}")
         
         # React to low battery
         if battery.get("percentage"):
             pct = int(battery["percentage"].rstrip("%"))
             if pct < 20 and battery.get("state") != "charging":
-                self.agent.overlay.show_bubble_message("Shimeji", f"Hey! Battery is at {pct}%! Plug in!", duration=8)
+                self._emit_bubble("Shimeji", f"Hey! Battery is at {pct}%! Plug in!", duration=8)
         
         return self.agent._reaction_interval
     
@@ -415,13 +432,13 @@ class DecisionExecutor:
             
             # Format response
             response = json.dumps(metrics, indent=2, ensure_ascii=False)
-            self.agent.overlay.show_chat_message("Shimeji", f"System Metrics:\n```\n{response}\n```")
+            self._emit_chat("Shimeji", f"System Metrics:\n```\n{response}\n```")
             
         except ImportError:
-            self.agent.overlay.show_chat_message("Shimeji", "System metrics unavailable (psutil not installed)")
+            self._emit_chat("Shimeji", "System metrics unavailable (psutil not installed)")
         except Exception as exc:
             LOGGER.error("Failed to get system metrics: %s", exc)
-            self.agent.overlay.show_chat_message("Shimeji", f"Failed to get metrics: {exc}")
+            self._emit_chat("Shimeji", f"Failed to get metrics: {exc}")
         
         return self.agent._reaction_interval
     
@@ -431,7 +448,7 @@ class DecisionExecutor:
         value = args.get("value")
         
         if not key or value is None:
-            self.agent.overlay.show_chat_message("Shimeji", "Error: Both 'key' and 'value' are required")
+            self._emit_chat("Shimeji", "Error: Both 'key' and 'value' are required")
             return self.agent._reaction_interval
         
         try:
@@ -447,12 +464,12 @@ class DecisionExecutor:
                     pass  # Keep as string
             
             await self.agent.memory.set_pref_async(key, value)
-            self.agent.overlay.show_chat_message("Shimeji", f"Updated preference: {key} = {value}")
+            self._emit_chat("Shimeji", f"Updated preference: {key} = {value}")
             LOGGER.info("Monitoring preference updated: %s = %s", key, value)
             
         except Exception as exc:
             LOGGER.error("Failed to set preference: %s", exc)
-            self.agent.overlay.show_chat_message("Shimeji", f"Failed to set preference: {exc}")
+            self._emit_chat("Shimeji", f"Failed to set preference: {exc}")
         
         return self.agent._reaction_interval
     
@@ -468,16 +485,16 @@ class DecisionExecutor:
             }
             
             if not monitoring_prefs:
-                self.agent.overlay.show_chat_message("Shimeji", "No monitoring preferences found")
+                self._emit_chat("Shimeji", "No monitoring preferences found")
                 return self.agent._reaction_interval
             
             # Format response
             prefs_text = "\n".join(f"{k}: {v}" for k, v in sorted(monitoring_prefs.items()))
-            self.agent.overlay.show_chat_message("Shimeji", f"Monitoring Preferences:\n```\n{prefs_text}\n```")
+            self._emit_chat("Shimeji", f"Monitoring Preferences:\n```\n{prefs_text}\n```")
             
         except Exception as exc:
             LOGGER.error("Failed to get preferences: %s", exc)
-            self.agent.overlay.show_chat_message("Shimeji", f"Failed to get preferences: {exc}")
+            self._emit_chat("Shimeji", f"Failed to get preferences: {exc}")
         
         return self.agent._reaction_interval
     
@@ -520,13 +537,13 @@ class DecisionExecutor:
                 for p in top_idle:
                     suggestions += f"- {p.get('name', 'unknown')} (PID {p.get('pid')}): {p.get('memory_percent', 0):.1f}% RAM\n"
                 
-                self.agent.overlay.show_chat_message("Shimeji", f"Resource Optimization Suggestion:\n{suggestions}")
+                self._emit_chat("Shimeji", f"Resource Optimization Suggestion:\n{suggestions}")
             else:
-                self.agent.overlay.show_chat_message("Shimeji", "No idle processes found to optimize.")
+                self._emit_chat("Shimeji", "No idle processes found to optimize.")
                 
         except Exception as exc:
             LOGGER.error("Resource optimization failed: %s", exc)
-            self.agent.overlay.show_chat_message("Shimeji", f"Optimization analysis failed: {exc}")
+            self._emit_chat("Shimeji", f"Optimization analysis failed: {exc}")
         
         return self.agent._reaction_interval
     
@@ -557,11 +574,11 @@ class DecisionExecutor:
                 top_pattern = patterns[0]
                 suggestion = f"Based on your patterns, you frequently use {top_pattern.get('app', 'applications')}. "
                 suggestion += "Would you like help with something specific?"
-                self.agent.overlay.show_chat_message("Shimeji", suggestion)
+                self._emit_chat("Shimeji", suggestion)
             else:
                 app_name = context_data.get("application", "Unknown")
                 if app_name != "Unknown":
-                    self.agent.overlay.show_chat_message("Shimeji", f"I see you're using {app_name}. Need help with anything?")
+                    self._emit_chat("Shimeji", f"I see you're using {app_name}. Need help with anything?")
                     
         except Exception as exc:
             LOGGER.error("Goal inference failed: %s", exc)
@@ -575,10 +592,10 @@ class DecisionExecutor:
         question = args.get("question", "What is in this file?")
         
         if not file_path or not os.path.exists(file_path):
-            self.agent.overlay.show_chat_message("Shimeji", f"File not found: {file_path}")
+            self._emit_chat("Shimeji", f"File not found: {file_path}")
             return self.agent._reaction_interval
         
-        self.agent.overlay.show_chat_message("Shimeji", f"Analyzing file: {file_path}...")
+        self._emit_chat("Shimeji", f"Analyzing file: {file_path}...")
         
         try:
             # Check file type
@@ -586,7 +603,7 @@ class DecisionExecutor:
                 # Use vision API
                 analysis = await self.agent._analyze_image_with_vision(file_path, question)
                 if analysis:
-                    self.agent.overlay.show_chat_message("Shimeji", f"Image Analysis:\n{analysis}")
+                        self._emit_chat("Shimeji", f"Image Analysis:\n{analysis}")
             else:
                 # Read text file
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -595,11 +612,11 @@ class DecisionExecutor:
                 # Use CLI brain to analyze
                 prompt = f"Analyze this file content and answer: {question}\n\nFile content:\n{content}"
                 response = await self.agent.cli_brain.respond(prompt, self.agent)
-                self.agent.overlay.show_chat_message("Shimeji", f"File Analysis:\n{response}")
+                self._emit_chat("Shimeji", f"File Analysis:\n{response}")
                 
         except Exception as exc:
             LOGGER.error("File analysis failed: %s", exc)
-            self.agent.overlay.show_chat_message("Shimeji", f"Analysis failed: {exc}")
+            self._emit_chat("Shimeji", f"Analysis failed: {exc}")
         
         return self.agent._reaction_interval
     
@@ -612,12 +629,12 @@ class DecisionExecutor:
         
         if audio_data:
             # Decode and process audio
-            self.agent.overlay.show_chat_message("Shimeji", "Processing voice command...")
+            self._emit_chat("Shimeji", "Processing voice command...")
             # In a real implementation, would decode audio and process
             # For now, just acknowledge
-            self.agent.overlay.show_chat_message("Shimeji", "Voice command received (processing requires voice handler setup)")
+            self._emit_chat("Shimeji", "Voice command received (processing requires voice handler setup)")
         else:
-            self.agent.overlay.show_chat_message("Shimeji", "No audio data provided")
+            self._emit_chat("Shimeji", "No audio data provided")
         
         return self.agent._reaction_interval
     
@@ -632,7 +649,7 @@ class DecisionExecutor:
             recurrence = args.get("recurrence", "")
             
             if not task_description or not time_str:
-                self.agent.overlay.show_chat_message("Shimeji", "Error: task_description and time are required")
+                self._emit_chat("Shimeji", "Error: task_description and time are required")
                 return self.agent._reaction_interval
             
             # Parse time (simplified - would need better parsing)
@@ -642,11 +659,11 @@ class DecisionExecutor:
                 metadata={"task": task_description, "time": time_str, "recurrence": recurrence}
             )
             
-            self.agent.overlay.show_chat_message("Shimeji", f"Task scheduled: {task_description} at {time_str}")
+            self._emit_chat("Shimeji", f"Task scheduled: {task_description} at {time_str}")
             
         except Exception as exc:
             LOGGER.error("Task scheduling failed: %s", exc)
-            self.agent.overlay.show_chat_message("Shimeji", f"Scheduling failed: {exc}")
+            self._emit_chat("Shimeji", f"Scheduling failed: {exc}")
         
         return self.agent._reaction_interval
     
@@ -656,7 +673,7 @@ class DecisionExecutor:
         time_str = args.get("time", "")
         
         if not message or not time_str:
-            self.agent.overlay.show_chat_message("Shimeji", "Error: message and time are required")
+            self._emit_chat("Shimeji", "Error: message and time are required")
             return self.agent._reaction_interval
         
         # Store reminder in memory
@@ -665,7 +682,7 @@ class DecisionExecutor:
             metadata={"reminder": message, "time": time_str}
         )
         
-        self.agent.overlay.show_chat_message("Shimeji", f"Reminder set: {message} at {time_str}")
+        self._emit_chat("Shimeji", f"Reminder set: {message} at {time_str}")
         
         return self.agent._reaction_interval
     
@@ -675,28 +692,28 @@ class DecisionExecutor:
         suggested_fix = args.get("suggested_fix", "")
         
         if not issue_type:
-            self.agent.overlay.show_chat_message("Shimeji", "Error: issue_type is required")
+            self._emit_chat("Shimeji", "Error: issue_type is required")
             return self.agent._reaction_interval
         
         try:
             if issue_type == "zombie":
                 # Kill zombie processes
                 result = ProductivityTools.execute_bash_command("ps aux | awk '$8 ~ /^Z/ { print $2 }' | xargs -r kill -9")
-                self.agent.overlay.show_chat_message("Shimeji", "Attempted to kill zombie processes")
+                self._emit_chat("Shimeji", "Attempted to kill zombie processes")
             elif issue_type == "temp_files":
                 # Clear temp files
                 result = ProductivityTools.execute_bash_command("find /tmp -type f -atime +7 -delete 2>/dev/null || true")
-                self.agent.overlay.show_chat_message("Shimeji", "Cleared old temporary files")
+                self._emit_chat("Shimeji", "Cleared old temporary files")
             elif suggested_fix:
                 # Execute suggested fix
                 result = ProductivityTools.execute_bash_command(suggested_fix)
-                self.agent.overlay.show_chat_message("Shimeji", f"Executed fix: {suggested_fix}")
+                self._emit_chat("Shimeji", f"Executed fix: {suggested_fix}")
             else:
-                self.agent.overlay.show_chat_message("Shimeji", f"Unknown issue type: {issue_type}")
+                self._emit_chat("Shimeji", f"Unknown issue type: {issue_type}")
                 
         except Exception as exc:
             LOGGER.error("Auto-fix failed: %s", exc)
-            self.agent.overlay.show_chat_message("Shimeji", f"Fix failed: {exc}")
+            self._emit_chat("Shimeji", f"Fix failed: {exc}")
         
         return self.agent._reaction_interval
     
@@ -710,20 +727,20 @@ class DecisionExecutor:
             urgency = args.get("urgency", "normal")
             
             if not message:
-                self.agent.overlay.show_chat_message("Shimeji", "Error: message is required")
+                self._emit_chat("Shimeji", "Error: message is required")
                 return self.agent._reaction_interval
             
             dbus = DBusIntegration()
             if dbus.is_available():
                 dbus.send_notification(title, message, urgency)
-                self.agent.overlay.show_chat_message("Shimeji", f"Notification sent: {title}")
+                self._emit_chat("Shimeji", f"Notification sent: {title}")
             else:
                 # Fallback
-                self.agent.overlay.show_chat_message("Shimeji", f"{title}: {message}")
+                self._emit_chat("Shimeji", f"{title}: {message}")
                 
         except Exception as exc:
             LOGGER.error("DBus notification failed: %s", exc)
-            self.agent.overlay.show_chat_message("Shimeji", f"Notification failed: {exc}")
+            self._emit_chat("Shimeji", f"Notification failed: {exc}")
         
         return self.agent._reaction_interval
     
@@ -747,7 +764,7 @@ class DecisionExecutor:
             if suggestion:
                 response += f"\n\n💡 {suggestion}"
             
-            self.agent.overlay.show_chat_message("Shimeji", response)
+            self._emit_chat("Shimeji", response)
             
         except Exception as exc:
             LOGGER.error("App context detection failed: %s", exc)
@@ -764,11 +781,11 @@ class DecisionExecutor:
             question = "Summarize the content of this web page. What is the main topic and key points?"
             analysis = await self.agent._analyze_image_with_vision(str(screenshot_path), question)
             if analysis:
-                self.agent.overlay.show_chat_message("Shimeji", f"Web Page Summary:\n{analysis}")
+                self._emit_chat("Shimeji", f"Web Page Summary:\n{analysis}")
             else:
-                self.agent.overlay.show_chat_message("Shimeji", "Couldn't analyze web page")
+                self._emit_chat("Shimeji", "Couldn't analyze web page")
         else:
-            self.agent.overlay.show_chat_message("Shimeji", "Couldn't capture screenshot")
+            self._emit_chat("Shimeji", "Couldn't capture screenshot")
         
         return self.agent._reaction_interval
     
@@ -780,11 +797,11 @@ class DecisionExecutor:
         if screenshot_path:
             analysis = await self.agent._analyze_image_with_vision(str(screenshot_path), question)
             if analysis:
-                self.agent.overlay.show_chat_message("Shimeji", f"Code Analysis:\n{analysis}")
+                self._emit_chat("Shimeji", f"Code Analysis:\n{analysis}")
             else:
-                self.agent.overlay.show_chat_message("Shimeji", "Couldn't analyze code")
+                self._emit_chat("Shimeji", "Couldn't analyze code")
         else:
-            self.agent.overlay.show_chat_message("Shimeji", "Couldn't capture screenshot")
+            self._emit_chat("Shimeji", "Couldn't capture screenshot")
         
         return self.agent._reaction_interval
     
@@ -803,14 +820,14 @@ class DecisionExecutor:
                 context_data = context
             
             if not action or not user_response:
-                self.agent.overlay.show_chat_message("Shimeji", "Error: action and user_response are required")
+                self._emit_chat("Shimeji", "Error: action and user_response are required")
                 return self.agent._reaction_interval
             
             feedback_learner = FeedbackLearner(self.agent.memory)
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, feedback_learner.record_feedback, action, user_response, context_data)
             
-            self.agent.overlay.show_chat_message("Shimeji", f"Feedback recorded: {action} -> {user_response}")
+            self._emit_chat("Shimeji", f"Feedback recorded: {action} -> {user_response}")
             
         except Exception as exc:
             LOGGER.error("Feedback recording failed: %s", exc)
@@ -840,9 +857,9 @@ class DecisionExecutor:
                 response = f"Detected {len(patterns)} patterns:\n"
                 for i, pattern in enumerate(patterns[:5], 1):
                     response += f"{i}. {pattern}\n"
-                self.agent.overlay.show_chat_message("Shimeji", response)
+                self._emit_chat("Shimeji", response)
             else:
-                self.agent.overlay.show_chat_message("Shimeji", "No patterns detected")
+                self._emit_chat("Shimeji", "No patterns detected")
                 
         except Exception as exc:
             LOGGER.error("Pattern detection failed: %s", exc)
@@ -856,10 +873,10 @@ class DecisionExecutor:
         duration = int(args.get("duration_seconds", 5))
         sensitivity = float(args.get("sensitivity", 0.5))
         
-        self.agent.overlay.show_chat_message("Shimeji", f"Monitoring ambient sound for {duration} seconds...")
+        self._emit_chat("Shimeji", f"Monitoring ambient sound for {duration} seconds...")
         # In a real implementation, would start audio monitoring
         # For now, just acknowledge
-        self.agent.overlay.show_chat_message("Shimeji", "Audio monitoring requires AudioProcessor setup")
+        self._emit_chat("Shimeji", "Audio monitoring requires AudioProcessor setup")
         
         return self.agent._reaction_interval
     
@@ -872,7 +889,7 @@ class DecisionExecutor:
             limit = int(args.get("limit", 5))
             
             if not query:
-                self.agent.overlay.show_chat_message("Shimeji", "Error: query is required")
+                self._emit_chat("Shimeji", "Error: query is required")
                 return self.agent._reaction_interval
             
             vector_memory = VectorMemory()
@@ -885,9 +902,9 @@ class DecisionExecutor:
                         fact = result.get('fact', '')
                         similarity = result.get('similarity', 0)
                         response += f"{i}. ({similarity:.2f}) {fact[:200]}...\n"
-                    self.agent.overlay.show_chat_message("Shimeji", response)
+                    self._emit_chat("Shimeji", response)
                 else:
-                    self.agent.overlay.show_chat_message("Shimeji", "No results found")
+                    self._emit_chat("Shimeji", "No results found")
             else:
                 # Fallback to regular search
                 results = await self.agent.memory.recall_relevant_async({"query": query}, limit)
@@ -895,13 +912,13 @@ class DecisionExecutor:
                     response = f"Search results for '{query}':\n\n"
                     for i, result in enumerate(results[:limit], 1):
                         response += f"{i}. {result}\n"
-                    self.agent.overlay.show_chat_message("Shimeji", response)
+                    self._emit_chat("Shimeji", response)
                 else:
-                    self.agent.overlay.show_chat_message("Shimeji", "No results found")
+                    self._emit_chat("Shimeji", "No results found")
                     
         except Exception as exc:
             LOGGER.error("Semantic search failed: %s", exc)
-            self.agent.overlay.show_chat_message("Shimeji", f"Search failed: {exc}")
+            self._emit_chat("Shimeji", f"Search failed: {exc}")
         
         return self.agent._reaction_interval
     
@@ -934,7 +951,7 @@ class DecisionExecutor:
                 for suggestion in insights['suggestions']:
                     response += f"- {suggestion.get('message', '')}\n"
             
-            self.agent.overlay.show_chat_message("Shimeji", response)
+            self._emit_chat("Shimeji", response)
             
         except Exception as exc:
             LOGGER.error("Pattern mining failed: %s", exc)
@@ -950,7 +967,7 @@ class DecisionExecutor:
             task_description = args.get("task_description", "")
             
             if not agent_type_str or not task_description:
-                self.agent.overlay.show_chat_message("Shimeji", "Error: agent_type and task_description are required")
+                self._emit_chat("Shimeji", "Error: agent_type and task_description are required")
                 return self.agent._reaction_interval
             
             # Get or create multi-agent coordinator
@@ -967,11 +984,11 @@ class DecisionExecutor:
                 context
             )
             
-            self.agent.overlay.show_chat_message("Shimeji", f"Spawned {agent_type_str} agent: {agent_id}")
+            self._emit_chat("Shimeji", f"Spawned {agent_type_str} agent: {agent_id}")
             
         except Exception as exc:
             LOGGER.error("Agent spawning failed: %s", exc)
-            self.agent.overlay.show_chat_message("Shimeji", f"Failed to spawn agent: {exc}")
+            self._emit_chat("Shimeji", f"Failed to spawn agent: {exc}")
         
         return self.agent._reaction_interval
     
@@ -991,7 +1008,7 @@ class DecisionExecutor:
             metadata={"type": knowledge_type, "data": data}
         )
         
-        self.agent.overlay.show_chat_message("Shimeji", f"Knowledge shared: {knowledge_type}")
+        self._emit_chat("Shimeji", f"Knowledge shared: {knowledge_type}")
         
         return self.agent._reaction_interval
     
@@ -1001,12 +1018,12 @@ class DecisionExecutor:
         reason = args.get("reason", "")
         
         if not tool_name or not reason:
-            self.agent.overlay.show_chat_message("Shimeji", "Error: tool_name and reason are required")
+            self._emit_chat("Shimeji", "Error: tool_name and reason are required")
             return self.agent._reaction_interval
         
         # Show permission request in chat
         message = f"Permission Request:\nTool: {tool_name}\nReason: {reason}\n\nAllow this action?"
-        self.agent.overlay.show_chat_message("Shimeji", message)
+        self._emit_chat("Shimeji", message)
         
         # Store permission request
         await self.agent.memory.save_fact_async(

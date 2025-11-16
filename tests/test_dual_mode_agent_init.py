@@ -1,14 +1,13 @@
 """Unit tests for DualModeAgent initialization."""
 
-from unittest.mock import patch
-
+from tests.fixtures.dbus_stub import mock_pydbus
+from tests.fixtures.google_stub import mock_google_generativeai
 from tests.fixtures.mock_gemini import MockGenerativeModel
 
 
 def test_dual_mode_agent_initializes_overlay_and_dialogue_manager():
-    """Ensure agent initializes overlay before dialogue manager to avoid attribute errors."""
-    # Delay imports so that patch is in effect
-    with patch('google.generativeai.GenerativeModel', MockGenerativeModel):
+    """Ensure agent wires overlay + UI sink before dialogue manager spins up."""
+    with mock_google_generativeai(MockGenerativeModel), mock_pydbus():
         from shimeji_dual_mode_agent import DualModeAgent
 
         agent = DualModeAgent(
@@ -20,9 +19,11 @@ def test_dual_mode_agent_initializes_overlay_and_dialogue_manager():
         assert hasattr(agent, "overlay")
         assert agent.overlay is not None
 
-        # Dialogue manager should be present and reference the overlay
+        # Dialogue manager should be present and reference the UI sink
+        assert hasattr(agent, "ui_event_sink")
+        assert agent.ui_event_sink is not None
         assert hasattr(agent, "_dialogue_manager")
-        assert agent._dialogue_manager.overlay is agent.overlay
+        assert agent._dialogue_manager.ui_event_sink is agent.ui_event_sink
 
         # Recent actions should be initialized before file handler context is set
         assert hasattr(agent, "_recent_actions")

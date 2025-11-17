@@ -91,9 +91,12 @@ class DecisionExecutor:
         """Execute a decision and return the next interval."""
         action = decision.action
         args = decision.arguments
-        timestamp = datetime.now(UTC).isoformat()
-        self.agent._recent_actions.append(f"{timestamp}:{action}")
-        self.agent.memory.record_action(action, args)
+        if hasattr(self.agent, "core") and hasattr(self.agent.core, "register_action"):
+            self.agent.core.register_action(action, args)
+        else:
+            timestamp = datetime.now(UTC).isoformat()
+            self.agent._recent_actions.append(f"{timestamp}:{action}")
+            self.agent.memory.record_action(action, args)
         
         # Check permission before executing
         if hasattr(self.agent, '_permission_manager') and self.agent._permission_manager:

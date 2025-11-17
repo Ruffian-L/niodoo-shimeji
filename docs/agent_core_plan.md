@@ -17,11 +17,16 @@ The rest of the agent still calls Gemini, updates memories, and drives the masco
 | Section (file + lines) | Why it is "brain" logic | Key dependencies | Extraction target |
 | --- | --- | --- | --- |
 | `_proactive_loop` – `shimeji_dual_mode_agent.py:L1014-L1055` | Pulls context/memory/emotion state, calls `proactive_brain.decide`, records metrics, and triggers execution interval selection. | `proactive_brain`, `memory`, `emotions`, `_recent_actions`, `_metrics`, `_decision_executor` | `AgentCore.run_proactive_cycle()` returning next interval + decision metadata. |
-| `_handle_critical_alert` – `shimeji_dual_mode_agent.py:L750-L789` | Builds enriched context, queries Gemini proactively, executes returned decision. | Same set as `_proactive_loop` + `_critical_alert_cache`, `_event_bus` | `AgentCore.handle_critical_alert(alert)` should encapsulate rate limiting + execution. Runner just enqueues task when event fires. |
-| `_vision_analysis_loop` – `shimeji_dual_mode_agent.py:L907-L959` | Periodically screens the desktop, requests permissions, invokes Gemini Vision, and updates context/memory. | `PermissionManager`, `ProductivityTools`, `AgentCore._analyze_image_with_vision`, `_merge_latest_context`, `_handle_detected_error` | `AgentCore.run_vision_probe(config)` orchestrates permission check, screenshot, analysis, and context merge. Runner only schedules the loop. |
+| `_handle_critical_alert` – `shimeji_dual_mode_agent.py:L750-L789` | Builds enriched context, queries Gemini proactively, executes returned decision. | Same set as `_proactive_loop`, `_event_bus` | `AgentCore.handle_critical_alert(alert)` should encapsulate rate limiting + execution. Runner just enqueues task when event fires. |
+| `_vision_analysis_loop` – `shimeji_dual_mode_agent.py:L907-L959` | Periodically screens the desktop, requests permissions, invokes Gemini Vision, and updates context/memory. | `PermissionManager`, `ProductivityTools`, `AgentCore._analyze_image_with_vision`, `AgentCore.merge_context`, `_handle_detected_error` | `AgentCore.run_vision_probe(config)` orchestrates permission check, screenshot, analysis, and context merge. Runner only schedules the loop. |
 | `_handle_detected_error` – `shimeji_dual_mode_agent.py:L962-L1006` | Crafts Gemini prompt, uses CLI brain to produce remediation, and emits UI events + mascot state transition. | `cli_brain`, `_emit_chat`, `_emit_bubble`, `_transition_mascot_state` | Move prompt construction + Gemini call into `AgentCore.resolve_detected_error()`. Runner can still own `_transition_mascot_state` by passing callback. |
 | `handle_cli_request` – `shimeji_dual_mode_agent.py:L1121-L1150` | Swaps modes, calls `cli_brain.respond`, mirrors chat/bubble output, and pushes dialogues. | `cli_brain`, `avatar_client`, `_emit_chat`, `_emit_bubble`, `_dispatch_dialogue`, `_mode_lock` | `AgentCore.handle_cli_request()` should handle sanitizing + Gemini call; runner retains mode switching + dialogue dispatch triggers. |
 | `_submit_cli_prompt` – `shimeji_dual_mode_agent.py:L1150-L1175` | Validates/sanitizes user input then schedules `_process_cli_prompt`. | `InputSanitizer`, `_loop`, `_emit_chat` | Keep in runner (UI callback) but let AgentCore expose a reusable sanitizer helper so other frontends reuse identical checks. |
+| Action history bookkeeping | `DecisionExecutor` reaches into `DualModeAgent._recent_actions` | Coupled to runner internals; hard to reuse elsewhere | `AgentCore.register_action(action, args)` maintains history/memory so executors can call through the core. |
+| `_cleanup_loop` – `shimeji_dual_mode_agent.py:L446-L477` | Periodically deletes old episodic memories via `MemoryManager`. | `MemoryManager.cleanup_old_episodes_async` | `AgentCore.memory_cleanup_loop(is_running, interval, days)` owns this maintenance loop while the runner just schedules it. |
+| System monitoring lifecycle | Runner instantiates and directly starts/stops `MonitoringManager`. | Requires `DualModeAgent` state to stay alive for other clients. | Pass the manager through `AgentCoreConfig` so `AgentCore.start_system_monitoring/stop_system_monitoring` manage the lifecycle. |
+| System alert routing | Runner subscribes to `SYSTEM_ALERT` events and spawns `_handle_critical_alert`. | Multiple frontends would need to reimplement alert policies. | AgentCore subscribes directly via the event bus, exposes `handle_system_alert`, and uses injected `show_alert_notification` for UI callbacks. |
+| D-Bus notification logging | Runner handles `EventType.DBUS_NOTIFICATION` with `_on_dbus_notification`. | Logging utilities should be shared so future clients can reuse the metadata feed. | AgentCore subscribes to `DBUS_NOTIFICATION` and provides `handle_dbus_notification` for centralized processing. |
 
 _Note:_ `_execute_decision()` (L1056-L1070) already delegates to `DecisionExecutor`, so we keep it runner-side for now; AgentCore simply calls into it.
 
@@ -47,6 +52,9 @@ class AgentCore:
 
     async def resolve_detected_error(self, error_text, *, on_alert_state):
         """Generate remediation plan via CLI brain and route UI updates."""
+
+    def register_action(self, action, args):
+        """Append to shared history and record the memory entry."""
 ```
 
 Runner responsibilities shrink to:

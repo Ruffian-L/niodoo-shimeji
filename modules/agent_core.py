@@ -15,8 +15,12 @@ import logging
 import os
 import re
 import time
+from collections import deque
+from datetime import UTC, datetime
 from concurrent.futures import Executor
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Deque, Dict, Optional, Tuple, TYPE_CHECKING
+from datetime import UTC, datetime
 
 import google.generativeai as genai
 from google.generativeai import types as genai_types
@@ -25,7 +29,7 @@ from modules.constants import DEFAULT_PRO_MODEL
 from modules.genai_utils import get_cached_model
 from modules.permission_manager import PermissionScope, PermissionStatus
 from modules.presentation_api import UIEvent
-from modules.system_monitor import SystemAlert
+from modules.system_monitor import SystemAlert, AlertSeverity
 from modules.event_bus import EventType
 from modules.file_handler import FileHandler
 from modules.input_sanitizer import InputSanitizer
@@ -42,48 +46,68 @@ if TYPE_CHECKING:  # pragma: no cover
     from modules.decision_executor import DecisionExecutor
     from modules.presentation_api import AvatarClient, UIEventSink
     from modules.permission_manager import PermissionManager
+    from modules.system_monitor import MonitoringManager
     from shimeji_dual_mode_agent import DualModeAgent
 
 
+@dataclass
+class AgentCoreConfig:
+    cli_brain: "CLIBrain"
+    proactive_brain: "ProactiveBrain"
+    avatar_client: "AvatarClient"
+    ui_event_sink: "UIEventSink"
+    process_pool: Optional[Executor]
+    memory: "MemoryManager"
+    emotions: "EmotionModel"
+    metrics: "PerformanceMetrics"
+    permission_manager: Optional["PermissionManager"]
+    take_screenshot: Callable[[], Optional[str]]
+    update_context: Callable[[Dict[str, Any]], None]
+    latest_context_getter: Callable[[], Dict[str, Any]]
+    context_getter: Callable[[], Awaitable[Dict[str, Any]]]
+    context_lock_getter: Optional[Callable[[], Optional[asyncio.Lock]]] = None
+    set_latest_vision_analysis: Optional[Callable[[Optional[Dict[str, Any]]], None]] = None
+    transition_mascot_state: Optional[Callable[[str], None]] = None
+    event_bus: Optional["EventBus"] = None
+    decision_executor: Optional["DecisionExecutor"] = None
+    monitoring_manager: Optional["MonitoringManager"] = None
+    show_alert_notification: Optional[Callable[[SystemAlert], None]] = None
+
+
 class AgentCore:
-    """Container for reusable agent behaviours and helpers."""
+    """Container for reusable agent behaviours and helpers.
+
+    The core owns cognition-heavy flows (CLI, proactive cycles, vision analysis,
+    decision execution) while exposing small utilities runners can call, such as
+    context accessors and `register_action` for history/memory bookkeeping.
+    """
 
     def __init__(
         self,
-        *,
-        cli_brain: "CLIBrain",
-        proactive_brain: "ProactiveBrain",
-        avatar_client: "AvatarClient",
-        ui_event_sink: "UIEventSink",
-        process_pool: Optional[Executor],
-        memory: "MemoryManager",
-        emotions: "EmotionModel",
-        metrics: "PerformanceMetrics",
-        permission_manager: Optional["PermissionManager"],
-        take_screenshot: Callable[[], Optional[str]],
-        merge_context: Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]],
-        set_latest_vision_analysis: Optional[Callable[[Optional[Dict[str, Any]]], None]],
-        context_getter: Callable[[], Awaitable[Dict[str, Any]]],
-        transition_mascot_state: Optional[Callable[[str], None]],
-        event_bus: Optional["EventBus"],
-        decision_executor: Optional["DecisionExecutor"],
+        config: AgentCoreConfig,
     ) -> None:
-        self._cli_brain = cli_brain
-        self._proactive_brain = proactive_brain
-        self._avatar_client = avatar_client
-        self._ui_event_sink = ui_event_sink
-        self._process_pool = process_pool
-        self._memory = memory
-        self._emotions = emotions
-        self._metrics = metrics
-        self._permission_manager = permission_manager
-        self._take_screenshot = take_screenshot
-        self._merge_context = merge_context
-        self._set_latest_vision_analysis = set_latest_vision_analysis or (lambda _: None)
-        self._context_getter = context_getter
-        self._transition_mascot_state = transition_mascot_state or (lambda _state: None)
-        self._event_bus = event_bus
-        self._decision_executor = decision_executor
+        self._cli_brain = config.cli_brain
+        self._proactive_brain = config.proactive_brain
+        self._avatar_client = config.avatar_client
+        self._ui_event_sink = config.ui_event_sink
+        self._process_pool = config.process_pool
+        self._memory = config.memory
+        self._emotions = config.emotions
+        self._metrics = config.metrics
+        self._permission_manager = config.permission_manager
+        self._take_screenshot = config.take_screenshot
+        self._update_context_callback = config.update_context
+        self._latest_context_getter = config.latest_context_getter
+        self._context_lock_getter = config.context_lock_getter or (lambda: None)
+        self._set_latest_vision_analysis = config.set_latest_vision_analysis or (lambda _: None)
+        self._context_getter = config.context_getter
+        self._transition_mascot_state = config.transition_mascot_state or (lambda _state: None)
+        self._event_bus = config.event_bus
+        self._decision_executor = config.decision_executor
+        self._monitoring_manager = config.monitoring_manager
+        self._show_alert_notification = config.show_alert_notification or (lambda _alert: None)
+        self._critical_alert_cache: Dict[str, float] = {}
+        self._recent_actions: Optional[Deque[str]] = None
         self._vision_prompt = (
             "Analyze this desktop screenshot. Identify the active application, "
             "window title, and any key UI elements or text. Based on this, "
@@ -93,6 +117,11 @@ class AgentCore:
             "{'app': '...', 'task': '...', 'file': '...', 'error_text': '...'}"
         )
         self._file_handler = FileHandler(self)
+        if self._event_bus:
+            self._event_bus.subscribe(EventType.DECISION_MADE, self._handle_decision_made_event)
+            self._event_bus.subscribe(EventType.MESSAGE_SENT, self._handle_message_sent_event)
+            self._event_bus.subscribe(EventType.SYSTEM_ALERT, self._handle_system_alert_event)
+            self._event_bus.subscribe(EventType.DBUS_NOTIFICATION, self._handle_dbus_notification_event)
 
     async def process_cli_prompt(self, agent: "DualModeAgent", prompt: str) -> None:
         """Process a CLI prompt, including vision and chat updates."""
@@ -176,10 +205,98 @@ class AgentCore:
         latest_context: Dict[str, Any],
         recent_actions: Deque[str],
     ) -> None:
+        self._recent_actions = recent_actions
         self._file_handler.set_context(latest_context, recent_actions)
 
     async def handle_file_drop(self, data: Any) -> None:
         await self._file_handler.handle_file_drop(data)
+
+    def register_action(self, action: str, arguments: Dict[str, Any]) -> None:
+        """Record an action in history and memory for downstream context."""
+
+        timestamp = datetime.now(UTC).isoformat()
+        if self._recent_actions is not None:
+            self._recent_actions.append(f"{timestamp}:{action}")
+        self._memory.record_action(action, arguments)
+
+    def latest_context(self) -> Dict[str, Any]:
+        """Return the most recent context snapshot supplied by the manager."""
+
+        return self._latest_context_getter()
+
+    def update_context(self, context: Dict[str, Any]) -> None:
+        """Replace the latest context using the injected callback."""
+
+        self._update_context_callback(context)
+
+    async def merge_context(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge updates into the latest context under the shared lock."""
+
+        lock = self._context_lock_getter()
+        if lock:
+            async with lock:
+                merged = {**self._latest_context_getter(), **updates}
+                self._update_context_callback(merged)
+                return merged
+
+        merged = {**self._latest_context_getter(), **updates}
+        self._update_context_callback(merged)
+        return merged
+
+    def _handle_decision_made_event(self, data: Any) -> None:
+        self._transition_mascot_state("Pondering")
+
+    def _handle_message_sent_event(self, data: Any) -> None:
+        self._transition_mascot_state("Interacting")
+
+    def _handle_dbus_notification_event(self, data: Any) -> None:
+        self.handle_dbus_notification(data)
+
+    def _handle_system_alert_event(self, alert: SystemAlert) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            LOGGER.warning("System alert received without running event loop; dropping alert")
+            return
+        loop.create_task(self.handle_system_alert(alert))
+
+    async def handle_system_alert(self, alert: SystemAlert) -> None:
+        """Route system alerts to notifications or proactive handling."""
+
+        if alert.severity == AlertSeverity.CRITICAL:
+            recent_actions = self._recent_actions
+            if recent_actions is None:
+                recent_actions = deque(maxlen=20)
+                self._recent_actions = recent_actions
+            context_snapshot = await self._context_getter()
+            await self.handle_critical_alert(
+                alert,
+                context=context_snapshot,
+                recent_actions=recent_actions,
+                show_alert_notification=self._show_alert_notification,
+            )
+            return
+
+        self._show_alert_notification(alert)
+
+    def handle_dbus_notification(self, data: Any) -> None:
+        """Process DBus notification/metadata events published on the bus."""
+
+        if not isinstance(data, dict):
+            LOGGER.debug("Ignoring non-dict DBus payload: %s", data)
+            return
+
+        event_type = data.get("type")
+        if event_type == "media_playing":
+            player = data.get("player", "unknown")
+            metadata = data.get("metadata", {})
+            title = metadata.get("xesam:title", "Unknown")
+            LOGGER.debug("Media playing: %s - %s", player, title)
+        elif event_type == "notification":
+            app_name = data.get("app_name", "unknown")
+            summary = data.get("summary", "")
+            body = data.get("body", "")
+            LOGGER.debug("Notification from %s: %s - %s", app_name, summary, body)
 
     async def compute_proactive_decision(
         self,
@@ -233,6 +350,39 @@ class AgentCore:
         interval = await self.execute_decision(decision, context_snapshot)
         return decision, interval
 
+    async def proactive_loop(
+        self,
+        *,
+        context_event: asyncio.Event,
+        is_running: Callable[[], bool],
+        is_proactive_mode: Callable[[], bool],
+        interval_getter: Callable[[], int],
+        recent_actions: Deque[str],
+    ) -> None:
+        """Own the proactive wait loop and reuse AgentCore's decision helpers."""
+
+        interval = interval_getter()
+        while is_running():
+            try:
+                await asyncio.wait_for(context_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                context_event.clear()
+
+            if not is_running():
+                break
+
+            if not is_proactive_mode():
+                interval = interval_getter()
+                continue
+
+            context_snapshot = await self._context_getter()
+            _, interval = await self.proactive_cycle(
+                context_snapshot=context_snapshot,
+                recent_actions=recent_actions,
+            )
+
     async def vision_analysis_loop(
         self,
         agent: "DualModeAgent",
@@ -252,6 +402,49 @@ class AgentCore:
                 raise
             except Exception as exc:  # pragma: no cover - runtime dependent
                 LOGGER.error("Vision analysis loop error: %s", exc)
+
+    async def memory_cleanup_loop(
+        self,
+        *,
+        is_running: Callable[[], bool],
+        interval_seconds: int,
+        days_to_keep: int,
+    ) -> None:
+        """Periodically prune old episodic memories while the agent runs."""
+
+        interval = max(0, interval_seconds)
+        while is_running():
+            await asyncio.sleep(interval)
+            if not is_running():
+                break
+            try:
+                await self._memory.cleanup_old_episodes_async(days_to_keep=days_to_keep)
+                LOGGER.debug(
+                    "Cleaned up old episodic memories (kept last %d days)",
+                    days_to_keep,
+                )
+            except Exception as exc:  # pragma: no cover - defensive logging
+                LOGGER.warning("Memory cleanup failed: %s", exc)
+
+    async def start_system_monitoring(self) -> None:
+        """Start the MonitoringManager if one was provided."""
+
+        if not self._monitoring_manager:
+            return
+        try:
+            await self._monitoring_manager.start()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            LOGGER.error("Failed to start system monitoring: %s", exc)
+
+    async def stop_system_monitoring(self) -> None:
+        """Stop the MonitoringManager if running."""
+
+        if not self._monitoring_manager:
+            return
+        try:
+            await self._monitoring_manager.stop()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            LOGGER.error("Failed to stop system monitoring: %s", exc)
 
     async def _perform_vision_analysis(self, agent: "DualModeAgent") -> None:
         if not self._take_screenshot:
@@ -279,7 +472,7 @@ class AgentCore:
             parsed = self._parse_vision_analysis(analysis)
             if parsed:
                 self._set_latest_vision_analysis(parsed)
-                await self._merge_context({"vision_analysis": parsed})
+                await self.merge_context({"vision_analysis": parsed})
                 error_text = parsed.get("error_text")
                 if error_text:
                     await self.handle_detected_error(agent, error_text)
@@ -287,12 +480,12 @@ class AgentCore:
                 LOGGER.debug("Vision analysis returned unstructured content; caching raw output")
                 cached = {"raw": analysis}
                 self._set_latest_vision_analysis(cached)
-                await self._merge_context({"vision_analysis": cached})
+                await self.merge_context({"vision_analysis": cached})
         except Exception as exc:  # pragma: no cover - runtime dependent
             LOGGER.error("Vision analysis parsing error: %s", exc)
             cached = {"raw": analysis}
             self._set_latest_vision_analysis(cached)
-            await self._merge_context({"vision_analysis": cached})
+            await self.merge_context({"vision_analysis": cached})
 
     @staticmethod
     def _parse_vision_analysis(analysis: str) -> Optional[Dict[str, Any]]:
@@ -334,7 +527,6 @@ class AgentCore:
         self,
         alert: SystemAlert,
         *,
-        cache: Dict[str, float],
         context: Dict[str, Any],
         recent_actions: Deque[str],
         show_alert_notification: Callable[[SystemAlert], None],
@@ -344,13 +536,13 @@ class AgentCore:
 
         cache_key = f"critical_alert:{alert.alert_type}"
         now = time.monotonic()
-        last_trigger = cache.get(cache_key, 0.0)
-        if now - last_trigger < rate_limit_seconds:
+        last_trigger = self._critical_alert_cache.get(cache_key)
+        if last_trigger is not None and now - last_trigger < rate_limit_seconds:
             LOGGER.debug("Critical alert rate limited: %s", alert.alert_type)
             show_alert_notification(alert)
             return
 
-        cache[cache_key] = now
+        self._critical_alert_cache[cache_key] = now
 
         try:
             context = dict(context)

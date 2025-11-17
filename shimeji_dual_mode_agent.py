@@ -42,8 +42,6 @@ from modules.constants import (
     DEFAULT_PROACTIVE_INTERVAL_SECONDS,
     DEFAULT_PRO_MODEL,
     DEFAULT_REACTION_INTERVAL_SECONDS,
-    DEFAULT_STARTUP_DELAY_SECONDS,
-    DEFAULT_VISION_ANALYSIS_INTERVAL_SECONDS,
     MIN_STARTUP_DELAY_SECONDS,
 )
 from modules.context_sniffer import ContextSniffer
@@ -67,7 +65,7 @@ from modules.context_manager import ContextManager
 from modules.dialogue_manager import DialogueManager
 from modules.input_sanitizer import InputSanitizer
 from modules.presentation_api import ShijimaAvatarClient, SpeechBubbleUISink, UIEvent
-from modules.agent_core import AgentCore
+from modules.agent_core import AgentCore, AgentCoreConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -337,6 +335,13 @@ class DualModeAgent:
         # Create event bus
         self._event_bus = EventBus()
 
+        # Create monitoring manager early so AgentCore can own it
+        self._monitoring_manager = MonitoringManager(
+            memory_manager=self.memory,
+            event_bus=self._event_bus,
+            alert_handler=None,
+        )
+
         # Create performance metrics
         self._metrics = PerformanceMetrics()
 
@@ -379,7 +384,6 @@ class DualModeAgent:
         self._anchor_task: Optional[asyncio.Task[None]] = None
         self._cleanup_task: Optional[asyncio.Task[None]] = None
         self._config_watcher_task: Optional[asyncio.Task[None]] = None
-        self._critical_alert_cache: Dict[str, float] = {}  # Rate limiting for critical alert proactive decisions
         self._vision_analysis_task: Optional[asyncio.Task[None]] = None
         self._latest_vision_analysis: Optional[Dict[str, Any]] = None
         
@@ -389,7 +393,7 @@ class DualModeAgent:
         self._process_pool: Optional[ProcessPoolExecutor] = ProcessPoolExecutor(max_workers=max_workers)
 
         # AgentCore already hosts a subset of the brain; expanding soon.
-        self.core = AgentCore(
+        core_config = AgentCoreConfig(
             cli_brain=self.cli_brain,
             proactive_brain=self.proactive_brain,
             avatar_client=self.avatar_client,
@@ -400,16 +404,20 @@ class DualModeAgent:
             metrics=self._metrics,
             permission_manager=self._permission_manager,
             take_screenshot=ProductivityTools.take_screenshot,
-            merge_context=self._merge_latest_context,
+            update_context=self._context_manager._update_context,
+            latest_context_getter=lambda: self._context_manager.latest_context,
+            context_lock_getter=lambda: self._context_lock,
             set_latest_vision_analysis=self._set_latest_vision_analysis,
             context_getter=self._get_context_snapshot,
             transition_mascot_state=self._transition_mascot_state,
             event_bus=self._event_bus,
             decision_executor=self._decision_executor,
+            monitoring_manager=self._monitoring_manager,
+            show_alert_notification=self._show_alert_notification,
         )
-        self.core.update_file_handler_context(self._latest_context, self._recent_actions)
+        self.core = AgentCore(core_config)
+        self.core.update_file_handler_context(self.core.latest_context(), self._recent_actions)
 
-        
         # Initialize hybrid privacy filter with process pool
         try:
             from modules.privacy_filter_hybrid import HybridPrivacyFilter
@@ -422,20 +430,6 @@ class DualModeAgent:
             LOGGER.warning("Failed to initialize hybrid privacy filter: %s", exc)
             self._hybrid_privacy_filter = None
         
-        # Create monitoring manager
-        self._monitoring_manager = MonitoringManager(
-            memory_manager=self.memory,
-            event_bus=self._event_bus,
-            alert_handler=None,  # Use event bus instead of direct handler to avoid duplicates
-        )
-        
-        # Subscribe to system alerts via event bus
-        self._event_bus.subscribe(EventType.SYSTEM_ALERT, self._on_system_alert)
-        
-        # Subscribe to events for state machine transitions
-        self._event_bus.subscribe(EventType.DECISION_MADE, self._on_decision_made)
-        self._event_bus.subscribe(EventType.MESSAGE_SENT, self._on_message_sent)
-        
         # Initialize D-Bus listener
         from modules.dbus_integration import DBusListener
         self._dbus_listener = DBusListener(event_bus=self._event_bus)
@@ -444,38 +438,8 @@ class DualModeAgent:
         from modules.journal_monitor import JournalMonitor
         self._journal_monitor = JournalMonitor(event_bus=self._event_bus)
         
-        # Subscribe to D-Bus events
-        self._event_bus.subscribe(EventType.DBUS_NOTIFICATION, self._on_dbus_notification)
-        
         # Subscribe to file drop events (P2.4)
         self._event_bus.subscribe(EventType.FILE_DROPPED, self._on_file_dropped)
-
-    # ------------------------------------------------------------------
-    async def _cleanup_loop(self) -> None:
-        """Periodically clean up old episodic memories."""
-        cleanup_interval = DEFAULT_MEMORY_CLEANUP_INTERVAL_SECONDS  # Run every hour
-        try:
-            cleanup_interval = int(
-                os.getenv("MEMORY_CLEANUP_INTERVAL", str(DEFAULT_MEMORY_CLEANUP_INTERVAL_SECONDS))
-            )
-        except ValueError:
-            pass
-        
-        days_to_keep = 30
-        try:
-            days_to_keep = int(os.getenv("MEMORY_CLEANUP_DAYS", "30"))
-        except ValueError:
-            pass
-        
-        while self._running:
-            await asyncio.sleep(cleanup_interval)
-            if not self._running:
-                break
-            try:
-                await self.memory.cleanup_old_episodes_async(days_to_keep=days_to_keep)
-                LOGGER.debug("Cleaned up old episodic memories (kept last %d days)", days_to_keep)
-            except Exception as exc:
-                LOGGER.warning("Memory cleanup failed: %s", exc)
 
     # ------------------------------------------------------------------
     async def start(self) -> None:
@@ -545,7 +509,28 @@ class DualModeAgent:
         await self._invocation_server.start()
         self._anchor_task = asyncio.create_task(self._anchor_loop())
         self._proactive_task = asyncio.create_task(self._proactive_loop())
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
+        cleanup_interval = DEFAULT_MEMORY_CLEANUP_INTERVAL_SECONDS
+        try:
+            cleanup_interval = int(
+                os.getenv("MEMORY_CLEANUP_INTERVAL", str(DEFAULT_MEMORY_CLEANUP_INTERVAL_SECONDS))
+            )
+        except ValueError:
+            pass
+
+        days_to_keep = 30
+        try:
+            days_to_keep = int(os.getenv("MEMORY_CLEANUP_DAYS", "30"))
+        except ValueError:
+            pass
+
+        self._cleanup_task = asyncio.create_task(
+            self.core.memory_cleanup_loop(
+                is_running=lambda: self._running,
+                interval_seconds=cleanup_interval,
+                days_to_keep=days_to_keep,
+            )
+        )
         
         # Start vision analysis loop (P2.2)
         vision_interval = int(
@@ -561,7 +546,7 @@ class DualModeAgent:
             )
         
         # Start system monitoring
-        await self._monitoring_manager.start()
+        await self.core.start_system_monitoring()
         
         # Start D-Bus listener
         await self._dbus_listener.start()
@@ -602,7 +587,7 @@ class DualModeAgent:
         await self._invocation_server.stop()
         
         # Stop system monitoring
-        await self._monitoring_manager.stop()
+        await self.core.stop_system_monitoring()
         
         # Stop D-Bus listener
         if hasattr(self, '_dbus_listener'):
@@ -627,11 +612,10 @@ class DualModeAgent:
         LOGGER.info("DualModeAgent stopped")
 
     # ------------------------------------------------------------------
-    def _update_context(self, context: Dict[str, Any]) -> None:
-        self._context_manager._update_context(context)
-
     @property
     def _latest_context(self) -> Dict[str, Any]:
+        if hasattr(self, "core"):
+            return self.core.latest_context()
         return self._context_manager.latest_context
 
     @_latest_context.setter
@@ -641,10 +625,13 @@ class DualModeAgent:
         This ensures metrics and notifications are correctly recorded and the
         event bus is triggered when context changes.
         """
-        # Use the ContextManager API (private method) to perform a full
-        # update with side effects (metrics/event bus). Not ideal to call a
-        # _private method but this is an internal coordination point.
-        self._context_manager._update_context(value)
+        # Route through AgentCore so context updates always trigger the
+        # ContextManager side effects (metrics/event bus). Fall back to the
+        # direct call for tests that bypass AgentCore construction.
+        if hasattr(self, "core"):
+            self.core.update_context(value)
+        else:
+            self._context_manager._update_context(value)
 
     @property
     def _context_changed(self) -> Optional[asyncio.Event]:
@@ -660,17 +647,6 @@ class DualModeAgent:
             async with self._context_lock:
                 return self._context_manager.latest_context
         return self._context_manager.latest_context
-
-    async def _merge_latest_context(self, updates: Dict[str, Any]) -> Dict[str, Any]:
-        """Merge updates into the latest context under lock."""
-        if self._context_lock:
-            async with self._context_lock:
-                merged = {**self._context_manager.latest_context, **updates}
-                self._context_manager._update_context(merged)
-                return merged
-        merged = {**self._context_manager.latest_context, **updates}
-        self._context_manager._update_context(merged)
-        return merged
 
     def _set_latest_vision_analysis(self, analysis: Optional[Dict[str, Any]]) -> None:
         self._latest_vision_analysis = analysis
@@ -740,26 +716,6 @@ class DualModeAgent:
             LOGGER.error("Failed to reload configuration: %s", exc)
     
     # ------------------------------------------------------------------
-    def _on_system_alert(self, alert: SystemAlert) -> None:
-        """Event bus handler for system alerts - routes based on severity."""
-        if alert.severity == AlertSeverity.CRITICAL:
-            # Trigger proactive decision for critical alerts
-            asyncio.create_task(self._handle_critical_alert(alert))
-        else:
-            # Show notification for warnings/info
-            self._show_alert_notification(alert)
-    
-    async def _handle_critical_alert(self, alert: SystemAlert) -> None:
-        """Delegate critical alert handling to AgentCore."""
-        context = await self._get_context_snapshot()
-        await self.core.handle_critical_alert(
-            alert,
-            cache=self._critical_alert_cache,
-            context=context,
-            recent_actions=self._recent_actions,
-            show_alert_notification=self._show_alert_notification,
-        )
-    
     def _show_alert_notification(self, alert: SystemAlert) -> None:
         """Show alert notification in speech bubble and chat."""
         # Format message based on severity
@@ -780,36 +736,6 @@ class DualModeAgent:
         # Show in UI via event sink
         self._emit_chat(author, message)
     
-    def _on_decision_made(self, data: Any) -> None:
-        """Handle decision made event - transition to Pondering state."""
-        self._transition_mascot_state("Pondering")
-    
-    def _on_message_sent(self, data: Any) -> None:
-        """Handle message sent event - transition to Interacting state."""
-        self._transition_mascot_state("Interacting")
-    
-    def _on_dbus_notification(self, data: Any) -> None:
-        """Handle D-Bus notification event.
-        
-        Args:
-            data: Event data containing notification or media state information
-        """
-        if not isinstance(data, dict):
-            return
-        
-        event_type = data.get("type")
-        if event_type == "media_playing":
-            player = data.get("player", "unknown")
-            metadata = data.get("metadata", {})
-            LOGGER.debug("Media playing: %s - %s", player, metadata.get("xesam:title", "Unknown"))
-            # Could update emotion model based on music
-        elif event_type == "notification":
-            app_name = data.get("app_name", "unknown")
-            summary = data.get("summary", "")
-            body = data.get("body", "")
-            LOGGER.debug("Notification from %s: %s - %s", app_name, summary, body)
-            # Could intercept notifications based on context (e.g., during Zoom calls)
-
     def _emit_chat(self, author: str, text: str) -> None:
         if not text:
             return
@@ -849,7 +775,7 @@ class DualModeAgent:
             return
 
         # Update file handler context
-        self.core.update_file_handler_context(self._latest_context, self._recent_actions)
+        self.core.update_file_handler_context(self.core.latest_context(), self._recent_actions)
 
         # Route to proactive agent if idle, or reactive agent if chat active
         if self.mode == AgentMode.PROACTIVE:
@@ -885,26 +811,14 @@ class DualModeAgent:
     # ------------------------------------------------------------------
     async def _proactive_loop(self) -> None:
         assert self._context_changed is not None
-        interval = self._proactive_interval
-        while self._running:
-            try:
-                await asyncio.wait_for(
-                    self._context_changed.wait(), timeout=interval
-                )
-            except asyncio.TimeoutError:
-                pass
-            finally:
-                self._context_changed.clear()
 
-            if not self._running or self.mode != AgentMode.PROACTIVE:
-                interval = self._proactive_interval
-                continue
-
-            context_snapshot = await self._get_context_snapshot()
-            _, interval = await self.core.proactive_cycle(
-                context_snapshot=context_snapshot,
-                recent_actions=self._recent_actions,
-            )
+        await self.core.proactive_loop(
+            context_event=self._context_changed,
+            is_running=lambda: self._running,
+            is_proactive_mode=lambda: self.mode == AgentMode.PROACTIVE,
+            interval_getter=lambda: self._proactive_interval,
+            recent_actions=self._recent_actions,
+        )
 
     async def _anchor_loop(self) -> None:
         last_anchor: Optional[Tuple[float, float]] = None

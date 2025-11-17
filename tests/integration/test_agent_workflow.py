@@ -116,7 +116,7 @@ async def test_decision_execution():
         
         # Test decision execution
         decision = ProactiveDecision("set_behavior", {"behavior_name": "Sit"})
-        interval = await agent.core.execute_decision(decision, agent._latest_context)
+        interval = await agent.core.execute_decision(decision, agent.core.latest_context())
         
         assert interval > 0
         agent.desktop_controller.set_behavior.assert_called_once()
